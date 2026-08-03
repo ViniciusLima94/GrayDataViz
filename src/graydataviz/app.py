@@ -42,9 +42,24 @@ def _cached_metadata(config: DataConfig, monkey: str, date: str, session: int) -
 
 
 @pn.cache
-def _cached_session(config: DataConfig, monkey: str, date: str, session: int, align_to: str):
+def _cached_session(
+    config: DataConfig,
+    monkey: str,
+    date: str,
+    session: int,
+    align_to: str,
+    exclude_slvr_msmod: bool,
+    only_unique_recordings: bool,
+):
     return load_session(
-        monkey, date, session, align_to=align_to, load_spike_times=True, config=config
+        monkey,
+        date,
+        session,
+        align_to=align_to,
+        exclude_slvr_msmod=exclude_slvr_msmod,
+        only_unique_recordings=only_unique_recordings,
+        load_spike_times=True,
+        config=config,
     )
 
 
@@ -87,6 +102,12 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
     )
     trial_select = pn.widgets.Select(label="Trial", options={})
     channel_select = pn.widgets.Select(label="Channel", options={})
+    include_flagged_channels = pn.widgets.Checkbox(
+        label="Include slvr/ms_mod-flagged channels", value=False
+    )
+    unique_recordings_only = pn.widgets.Checkbox(
+        label="Unique recordings only", value=False
+    )
     show_spikes = pn.widgets.Checkbox(label="Overlay spikes", value=False)
     filter_enabled = pn.widgets.Checkbox(label="Apply bandpass filter", value=False)
     band_select = pn.widgets.Select(label="Band preset", options=["custom"])
@@ -141,6 +162,8 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
                 date_select.value,
                 session_select.value,
                 align_select.value,
+                not include_flagged_channels.value,
+                unique_recordings_only.value,
             )
         except GrayDataVizError as exc:
             info_pane.object = f"**Error loading session:** {exc}"
@@ -220,7 +243,14 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
 
     monkey_select.param.watch(lambda e: (_update_dates(), _update_band_options()), "value")
     date_select.param.watch(_update_sessions, "value")
-    for widget in (monkey_select, date_select, session_select, align_select):
+    for widget in (
+        monkey_select,
+        date_select,
+        session_select,
+        align_select,
+        include_flagged_channels,
+        unique_recordings_only,
+    ):
         widget.param.watch(_reload_session, "value")
     for widget in (
         trial_select,
@@ -247,6 +277,8 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
         "## Trial / channel",
         trial_select,
         channel_select,
+        include_flagged_channels,
+        unique_recordings_only,
         pn.layout.Divider(),
         "## Overlays",
         show_spikes,

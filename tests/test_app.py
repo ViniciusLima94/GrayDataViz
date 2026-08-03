@@ -24,7 +24,7 @@ def test_build_app_smoke(data_config):
 
     assert widgets["Monkey"].value == MONKEY
     assert len(widgets["Trial"].options) == N_TRIALS
-    assert len(widgets["Channel"].options) == 2  # one channel excluded (slvr)
+    assert len(widgets["Channel"].options) == 2  # one channel excluded (slvr) by default
 
     first_trial = next(iter(widgets["Trial"].options.values()))
     other_trials = [v for v in widgets["Trial"].options.values() if v != first_trial]
@@ -33,3 +33,23 @@ def test_build_app_smoke(data_config):
     widgets["Overlay spikes"].value = True
     widgets["Apply bandpass filter"].value = True
     widgets["Band preset"].value = widgets["Band preset"].options[0]
+
+
+def test_include_flagged_channels_toggle(data_config):
+    app = build_app(config=data_config)
+
+    widgets = {}
+
+    def _collect(obj):
+        label = getattr(obj, "label", None)
+        if label:
+            widgets.setdefault(label, obj)
+        for child in getattr(obj, "objects", []):
+            _collect(child)
+
+    for root in list(app.sidebar) + list(app.main):
+        _collect(root)
+
+    assert len(widgets["Channel"].options) == 2
+    widgets["Include slvr/ms_mod-flagged channels"].value = True
+    assert len(widgets["Channel"].options) == 3
