@@ -32,7 +32,10 @@ MS_MOD = np.array([0, 0, 0])
 
 TRIAL_TYPE = np.array([1.0, 1.0, 2.0, 3.0])
 BEHAVIORAL_RESPONSE = np.array([1.0, 0.0, 1.0, 1.0])
-SAMPLE_IMAGE = np.array([1.0, 2.0, 6.0, 6.0])
+# Task trials (0, 1) reference real embedded images; fixation trials (2, 3) show none.
+SAMPLE_IMAGE = np.array([1.0, 2.0, np.nan, np.nan])
+MATCH_IMAGE = np.array([2.0, 1.0, np.nan, np.nan])
+NONMATCH_IMAGE = np.array([1.0, 2.0, np.nan, np.nan])
 SAMPLE_ON = np.array([1000, 1000, 1000, 1000])
 SAMPLE_OFF = SAMPLE_ON + 200
 MATCH_ON = SAMPLE_ON + np.array([1500, 1600, 1500, 1500])
@@ -40,8 +43,19 @@ MATCH_ON = SAMPLE_ON + np.array([1500, 1600, 1500, 1500])
 N_TRIALS = len(TRIAL_TYPE)
 N_CHANNELS_TOTAL = len(CHANNEL_NUMBERS)
 
+N_IMAGES = 2
+IMAGE_NAMES = ["apple", "banana"]
+IMAGE_LOCATIONS = np.array([[1.0, 2.0], [3.0, 4.0]])
 
-def _write_recording_info(path):
+
+def _make_image_data(rng: np.random.Generator) -> np.ndarray:
+    images = np.empty(N_IMAGES, dtype=object)
+    for i in range(N_IMAGES):
+        images[i] = rng.integers(0, 255, size=(4, 4, 3)).astype(np.uint8)
+    return images
+
+
+def _write_recording_info(path, rng: np.random.Generator):
     recording_info = {
         "channel_count": float(N_CHANNELS_TOTAL),
         "lfp_sampling_rate": FSAMPLE,
@@ -50,6 +64,9 @@ def _write_recording_info(path):
         "depth": DEPTH,
         "slvr": SLVR.astype(float),
         "ms_mod": MS_MOD.astype(float),
+        "image_data": _make_image_data(rng),
+        "image_names": np.array(IMAGE_NAMES, dtype=object),
+        "image_locations": IMAGE_LOCATIONS,
     }
     scio.savemat(path, {"recording_info": recording_info})
 
@@ -60,6 +77,8 @@ def _write_trial_info(path):
         grp.create_dataset("trial_type", data=TRIAL_TYPE)
         grp.create_dataset("behavioral_response", data=BEHAVIORAL_RESPONSE)
         grp.create_dataset("sample_image", data=SAMPLE_IMAGE)
+        grp.create_dataset("match_image", data=MATCH_IMAGE)
+        grp.create_dataset("nonmatch_image", data=NONMATCH_IMAGE)
         grp.create_dataset("sample_on", data=SAMPLE_ON.astype(float))
         grp.create_dataset("sample_off", data=SAMPLE_OFF.astype(float))
         grp.create_dataset("match_on", data=MATCH_ON.astype(float))
@@ -90,10 +109,10 @@ def data_config(tmp_path) -> DataConfig:
     session_dir = raw_root / MONKEY / DATE / f"session{SESSION:02d}"
     session_dir.mkdir(parents=True)
 
-    _write_recording_info(session_dir / "recording_info.mat")
+    rng = np.random.default_rng(0)
+    _write_recording_info(session_dir / "recording_info.mat", rng)
     _write_trial_info(session_dir / "trial_info.mat")
 
-    rng = np.random.default_rng(0)
     for i in range(N_TRIALS):
         _write_trial_recording(session_dir / f"{DATE}_trial_{i:03d}.mat", rng)
 

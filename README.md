@@ -1,10 +1,16 @@
 # GrayDataViz
 
-Data loading (and, eventually, visualization) toolkit for the Gray Lab primate
-LFP dataset, replacing the loading code duplicated across `GrayData-Analysis`
-(`GDa/`) and `phase_coupling_analysis` (`src/`).
+Data loading and visualization toolkit for the Gray Lab primate LFP dataset,
+replacing the loading code duplicated across `GrayData-Analysis` (`GDa/`) and
+`phase_coupling_analysis` (`src/`).
 
-This is phase 1: a standalone, tested loading API. Visualization comes later.
+Phase 1 was a standalone, tested loading API. Phase 2 (this update) adds a
+Panel-based GUI for browsing raw LFP recordings: pick a monkey/date/session/
+trial/channel, see the trial type and behavioral response, see the cue/match/
+non-match stimulus images (these are embedded directly in each session's
+`recording_info.mat` as `image_data`/`image_names` — not separate files),
+overlay the spike raster, and overlay a bandpass-filtered version of the trace
+on top of the raw signal.
 
 ## What's different from `GDa` / `src`
 
@@ -29,10 +35,11 @@ This is phase 1: a standalone, tested loading API. Visualization comes later.
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
+pip install -e ".[dev]"       # loading API + tests
+pip install -e ".[gui]"       # + panel/matplotlib, to also run the GUI
 ```
 
-## Usage
+## Usage: loading API
 
 ```python
 from graydataviz import DataConfig, list_dates, load_session, load_power, TrialType
@@ -47,6 +54,24 @@ task_trials = ds.sel(trials=ds.lfp.trials)  # or use filter_trial_indexes()
 power = load_power("lucy", dates[0], trial_type=TrialType.TASK, config=config)
 ```
 
+## Usage: GUI
+
+```bash
+graydataviz-gui                # after `pip install -e ".[gui]"`
+# or
+python -m graydataviz.app
+```
+
+By default it points at `DataConfig()` (i.e. `GRAYDATAVIZ_RAW_ROOT` /
+`GRAYDATAVIZ_RESULTS_ROOT`, or `~/funcog/gda/GrayLab` / `~/funcog/gda/Results`).
+Set those env vars to point at wherever the raw data actually lives before
+launching.
+
+The sidebar lets you pick monkey → date → session → alignment → trial →
+channel; the main panel shows the LFP trace (with optional bandpass-filtered
+overlay and spike-raster overlay) plus the cue/match/non-match stimulus images
+for the selected trial, alongside its trial type and behavioral response.
+
 ## Layout
 
 ```
@@ -58,6 +83,9 @@ src/graydataviz/
 ├── trials.py     # TrialType / BehavioralResponse, filter_trial_indexes
 ├── session.py    # load_session: raw LFP + spikes -> xr.Dataset
 ├── derived.py    # load_power / load_pec_strength / load_crackle_cooccurrence / load_burst_probability
+├── stimuli.py    # get_stimulus_image / get_stimulus_name (from embedded image_data)
+├── filters.py    # bandpass_filter (zero-phase Butterworth), per-monkey DEFAULT_BANDS
+├── app.py        # Panel GUI (build_app / main)
 └── exceptions.py
 ```
 

@@ -12,8 +12,10 @@ from .exceptions import (
     RawDataNotFoundError,
 )
 from .discovery import list_dates, list_monkeys, list_sessions
+from .filters import DEFAULT_BANDS, band_presets, bandpass_filter
 from .metadata import SessionMetadata, load_session_metadata
 from .session import load_session
+from .stimuli import get_stimulus_image, get_stimulus_name
 from .trials import BehavioralResponse, TrialType, filter_trial_indexes
 
 __all__ = [
@@ -35,4 +37,9 @@ __all__ = [
     "TrialType",
     "BehavioralResponse",
     "filter_trial_indexes",
+    "bandpass_filter",
+    "band_presets",
+    "DEFAULT_BANDS",
+    "get_stimulus_image",
+    "get_stimulus_name",
 ]

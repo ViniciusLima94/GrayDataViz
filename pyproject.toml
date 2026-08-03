@@ -20,10 +20,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+gui = [
+    "panel",
+    "matplotlib",
+]
 dev = [
     "pytest",
     "pytest-cov",
+    "panel",
+    "matplotlib",
 ]
+
+[project.scripts]
+graydataviz-gui = "graydataviz.app:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/graydataviz"]
