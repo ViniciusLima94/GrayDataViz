@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "graydataviz"
+version = "0.1.0"
+description = "Data loading and visualization toolkit for the Gray Lab primate LFP dataset"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "pandas",
+    "xarray",
+    "h5py",
+    "netCDF4",
+    "h5netcdf",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/graydataviz"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
