@@ -55,6 +55,66 @@ By default it points at `DataConfig()` (`GRAYDATAVIZ_RAW_ROOT` /
 if unset). Set those env vars to point at wherever the raw data actually
 lives before launching.
 
+## Sharing the GUI over the internet
+
+For letting others try the GUI without giving them the raw data, without
+paying for cloud infra, and without exposing more of the dataset than
+intended:
+
+1. **Scope the data** the server can see to just what you want to share, via
+   a separate raw-data root containing only symlinks to the sessions you're
+   sharing (`discovery.py` only reports what's actually reachable under
+   `raw_root`, so this is a filesystem-level guarantee, not an app-level one):
+
+   ```bash
+   mkdir -p /path/to/GrayLab_demo/lucy
+   ln -s /path/to/real/GrayLab/lucy/141017 /path/to/GrayLab_demo/lucy/141017
+   ```
+
+2. **Add basic auth** when serving, so the URL alone isn't enough to get in.
+   `pn.serve` takes `basic_auth` (a `{username: password}` dict) and requires
+   a `cookie_secret`:
+
+   ```python
+   import secrets
+   import panel as pn
+   from graydataviz.app import build_app
+
+   pn.serve(
+       build_app,
+       port=5679,
+       address="localhost",
+       basic_auth={"viewer": "<a real password>"},
+       cookie_secret=secrets.token_urlsafe(32),
+       websocket_origin=["<your-public-hostname>", "localhost:5679"],
+   )
+   ```
+
+   `websocket_origin` must include whatever public hostname you'll expose —
+   Bokeh's websocket layer rejects connections from origins it doesn't know
+   about by default (the symptom is the page loading its header/chrome but
+   never rendering any widgets or plots).
+
+3. **Expose it** with a free Cloudflare quick tunnel (no account needed):
+
+   ```bash
+   brew install cloudflared
+   cloudflared tunnel --url http://localhost:5679
+   ```
+
+   This prints a random `https://<words>.trycloudflare.com` URL that proxies
+   to your local server. Caveats: it only works while your machine and the
+   `pn.serve`/tunnel processes are running, the URL is random and changes if
+   the tunnel restarts, and Cloudflare gives no uptime guarantee for these
+   account-less tunnels — fine for sharing a quick look, not for something
+   depended on long-term. For that, a real (paid) VM or PaaS host with a
+   fixed domain would be the next step.
+
+Only static images ever reach the browser — every plot is rendered
+server-side to a PNG (`pn.pane.Matplotlib`, not a Bokeh-native chart), so
+there's no numeric data embedded in the page for someone to extract via
+dev tools, and the app has no export/download endpoint.
+
 ## Loading API
 
 - **Filesystem auto-discovery** instead of hard-coded per-monkey date lists:
@@ -125,4 +185,3 @@ Tests build small synthetic `.mat`/HDF5/NetCDF fixtures on the fly (see
 ```bash
 pytest
 ```
-# GrayDataViz
