@@ -4,15 +4,58 @@ Data loading and visualization toolkit for the Gray Lab primate LFP dataset,
 replacing the loading code duplicated across `GrayData-Analysis` (`GDa/`) and
 `phase_coupling_analysis` (`src/`).
 
-Phase 1 was a standalone, tested loading API. Phase 2 (this update) adds a
-Panel-based GUI for browsing raw LFP recordings: pick a monkey/date/session/
-trial/channel, see the trial type and behavioral response, see the cue/match/
-non-match stimulus images (these are embedded directly in each session's
-`recording_info.mat` as `image_data`/`image_names` — not separate files),
-overlay the spike raster, and overlay a bandpass-filtered version of the trace
-on top of the raw signal.
+Phase 1 is a standalone, tested loading API. Phase 2 is a Panel-based GUI for
+browsing raw LFP recordings, comparing two channels, and inspecting their
+power spectra and coherence — all computed with the same multitaper
+parameters (`bandwidth`, `fmin`, `fmax`) as `phase_coupling_analysis`.
 
-## What's different from `GDa` / `src`
+## GUI
+
+![Two channels (F1 ch 95, V1 ch 247) for lucy/141017, trial 99, with spikes overlaid](docs/screenshots/lucy_141017_V1_247_vs_F1_95_trial99.png)
+
+*Monkey lucy, date 141017, trial 99 (TASK, CORRECT), channels F1 (ch 95) and
+V1 (ch 247) with spikes overlaid — LFP traces on top, then each channel's
+power spectrum and their coherence below, all averaged over every trial in
+the session.*
+
+- **Session picker**: monkey → date → session → cue/match alignment, all
+  auto-discovered from disk (see [Loading API](#loading-api) below).
+- **Trial**: pick any trial; the dropdown shows its type and behavioral
+  response inline (e.g. "Trial 99 — TASK, CORRECT").
+- **Channel(s)**: select **one or two** channels from the multi-select
+  (`Clear selection` resets it). One channel shows its LFP trace and power
+  spectrum. Two channels overlay both LFP traces in one plot and add a
+  coherence panel between their two power spectra.
+- **Include slvr/ms_mod-flagged channels** / **Unique recordings only**:
+  toggle the two channel-filtering behaviors `load_session` supports, instead
+  of them being silently baked in.
+- **Overlay spikes**: adds each channel's spike raster (tick marks) above its
+  trace, in that channel's own color.
+- **Apply bandpass filter**: pick a per-monkey band preset (from
+  `phase_coupling_analysis/config.py`'s `bands`) or a custom range. When
+  enabled, the filtered signal **replaces** the raw one everywhere (trace,
+  power spectra, coherence) rather than overlaying both.
+- **Power spectra and coherence use every trial** in the session for the
+  selected channel(s) — not just the one currently selected for the raw
+  trace — matching how `xr_psd_array_multitaper`/`conn_spec_average` are
+  actually used in the pipeline. Results are cached per channel/filter
+  selection so switching trials or toggling spikes stays fast.
+
+Run it with:
+
+```bash
+pip install -e ".[gui]"        # panel, matplotlib, mne
+graydataviz-gui
+# or
+python -m graydataviz.app
+```
+
+By default it points at `DataConfig()` (`GRAYDATAVIZ_RAW_ROOT` /
+`GRAYDATAVIZ_RESULTS_ROOT`, or `~/funcog/gda/GrayLab` / `~/funcog/gda/Results`
+if unset). Set those env vars to point at wherever the raw data actually
+lives before launching.
+
+## Loading API
 
 - **Filesystem auto-discovery** instead of hard-coded per-monkey date lists:
   `list_monkeys()`, `list_dates(monkey)`, `list_sessions(monkey, date)` scan the
@@ -24,22 +67,16 @@ on top of the raw signal.
 - **One `xr.Dataset`** (`load_session`) with `"lfp"` and optional `"spikes"`
   data variables sharing a single `attrs` dict, instead of two `DataArray`s
   with the metadata dict duplicated between them.
+- **Per-monkey/alignment trial windows** (`windows.py`) resolved automatically
+  from `(monkey, align_to)`, matching `phase_coupling_analysis/config.py`'s
+  `return_evt_dt` — using one monkey's window on another's data can slice past
+  the end of its shorter recordings.
 - **Typed trial vocabulary** (`TrialType`, `BehavioralResponse` enums) instead
   of bare integer codes.
 - **Descriptive errors**: missing raw/derived files raise
   `RawDataNotFoundError` / `DerivedDataNotFoundError` naming the exact path
   (and, for derived products, what files *are* present in that directory)
   instead of a bare `FileNotFoundError` from deep inside `xarray`/`h5py`.
-
-## Install
-
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"       # loading API + tests
-pip install -e ".[gui]"       # + panel/matplotlib, to also run the GUI
-```
-
-## Usage: loading API
 
 ```python
 from graydataviz import DataConfig, list_dates, load_session, load_power, TrialType
@@ -54,23 +91,13 @@ task_trials = ds.sel(trials=ds.lfp.trials)  # or use filter_trial_indexes()
 power = load_power("lucy", dates[0], trial_type=TrialType.TASK, config=config)
 ```
 
-## Usage: GUI
+## Install
 
 ```bash
-graydataviz-gui                # after `pip install -e ".[gui]"`
-# or
-python -m graydataviz.app
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"       # loading API + tests
+pip install -e ".[gui]"       # + panel/matplotlib/mne, to also run the GUI
 ```
-
-By default it points at `DataConfig()` (i.e. `GRAYDATAVIZ_RAW_ROOT` /
-`GRAYDATAVIZ_RESULTS_ROOT`, or `~/funcog/gda/GrayLab` / `~/funcog/gda/Results`).
-Set those env vars to point at wherever the raw data actually lives before
-launching.
-
-The sidebar lets you pick monkey → date → session → alignment → trial →
-channel; the main panel shows the LFP trace (with optional bandpass-filtered
-overlay and spike-raster overlay) plus the cue/match/non-match stimulus images
-for the selected trial, alongside its trial type and behavioral response.
 
 ## Layout
 
@@ -81,11 +108,12 @@ src/graydataviz/
 ├── io.py         # low-level .mat (legacy + HDF5) readers
 ├── metadata.py   # SessionMetadata: recording_info + trial_info
 ├── trials.py     # TrialType / BehavioralResponse, filter_trial_indexes
+├── windows.py    # per-monkey/alignment default trial time windows
 ├── session.py    # load_session: raw LFP + spikes -> xr.Dataset
 ├── derived.py    # load_power / load_pec_strength / load_crackle_cooccurrence / load_burst_probability
 ├── stimuli.py    # get_stimulus_image / get_stimulus_name (from embedded image_data)
 ├── filters.py    # bandpass_filter (zero-phase Butterworth), per-monkey DEFAULT_BANDS
-├── app.py        # Panel GUI (build_app / main)
+├── app.py        # Panel GUI (build_app / main): LFP trace, multitaper power spectra, coherence
 └── exceptions.py
 ```
 
@@ -97,3 +125,4 @@ Tests build small synthetic `.mat`/HDF5/NetCDF fixtures on the fly (see
 ```bash
 pytest
 ```
+# GrayDataViz
