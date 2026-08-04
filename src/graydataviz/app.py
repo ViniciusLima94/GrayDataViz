@@ -145,9 +145,13 @@ def _lfp_trace_figure(
     spike_series: list[dict],
     figsize: tuple[float, float],
     title: str | None = None,
+    event_markers: list[dict] | None = None,
 ) -> Figure:
     """`series`: dicts with `y`, `color`, `linestyle`, `label`.
     `spike_series`: dicts with `spikes` (bool array), `color`, `label`.
+    `event_markers`: dicts with `time` (seconds, relative to the plotted
+    window), `linestyle`, `label` -- drawn as vertical reference lines in a
+    neutral gray so they read as timing markers, not data series.
 
     All spike rows sit above the combined range of every plotted trace (not
     each channel's own range) since they share one y-axis -- otherwise a
@@ -160,6 +164,8 @@ def _lfp_trace_figure(
     for s in series:
         ax.plot(time, s["y"], color=s["color"], lw=1 if s["linestyle"] == "-" else 1.2,
                  linestyle=s["linestyle"], label=s["label"])
+    for m in event_markers or []:
+        ax.axvline(m["time"], color="0.4", lw=1, linestyle=m["linestyle"], label=m["label"])
     if spike_series and series:
         all_y = np.concatenate([s["y"] for s in series])
         y_top = all_y.max() + 0.05 * np.ptp(all_y)
@@ -243,6 +249,7 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
         label="Unique recordings only", value=False
     )
     show_spikes = pn.widgets.Checkbox(label="Overlay spikes", value=False)
+    show_events = pn.widgets.Checkbox(label="Show cue onset/offset & match onset", value=False)
     filter_enabled = pn.widgets.Checkbox(label="Apply bandpass filter", value=False)
     band_select = pn.widgets.Select(label="Band preset", options=["custom"])
     custom_low = pn.widgets.FloatInput(label="Low (Hz)", value=8.0, start=0.0)
@@ -354,6 +361,23 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
                 cache[key] = compute_fn()
             return cache[key]
 
+        def _event_markers_for_trial():
+            # cue onset/offset and match onset, in the same relative-to-align_to
+            # seconds as `time` -- no match-offset field exists in trial_info.
+            if not show_events.value:
+                return []
+            pos = int(np.where(ds.trials.values == trial_index)[0][0])
+            align_to = ds.attrs["align_to"]
+            t0 = (ds.attrs["t_cue_on"] if align_to == "cue" else ds.attrs["t_match_on"])[pos]
+            cue_on = (ds.attrs["t_cue_on"][pos] - t0) / fsample
+            cue_off = (ds.attrs["t_cue_off"][pos] - t0) / fsample
+            match_on = (ds.attrs["t_match_on"][pos] - t0) / fsample
+            return [
+                {"time": cue_on, "linestyle": "-", "label": "cue onset"},
+                {"time": cue_off, "linestyle": "--", "label": "cue offset"},
+                {"time": match_on, "linestyle": ":", "label": "match onset"},
+            ]
+
         def _all_trials_raw(ch_idx):
             return ds.lfp.isel(roi=ch_idx).values  # (n_trials, n_times)
 
@@ -426,7 +450,9 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
                 if spikes is not None
                 else []
             )
-            lfp_pane.object = _lfp_trace_figure(time, series, spike_series, figsize=(8, 3))
+            lfp_pane.object = _lfp_trace_figure(
+                time, series, spike_series, figsize=(8, 3), event_markers=_event_markers_for_trial()
+            )
 
             psd_pane.object = _psd_figure(_channel_psd_series(ch_idx), figsize=(4, 3))
             main.objects = [info_pane, lfp_pane, psd_pane]
@@ -453,7 +479,9 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
                 spike_series.append(
                     {"spikes": spk2, "color": _COLOR_FILTERED, "label": f"{label2} spikes"}
                 )
-            lfp_pane.object = _lfp_trace_figure(time, series, spike_series, figsize=(9, 3))
+            lfp_pane.object = _lfp_trace_figure(
+                time, series, spike_series, figsize=(9, 3), event_markers=_event_markers_for_trial()
+            )
 
             psd_pane.object = _psd_figure(_channel_psd_series(ch1_idx), figsize=(4, 3), title=label1)
             psd_pane_2.object = _psd_figure(_channel_psd_series(ch2_idx), figsize=(4, 3), title=label2)
@@ -471,9 +499,12 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
         ttype = TrialType(int(row["trial_type"])).name
         resp = row.get("behavioral_response")
         resp_label = BehavioralResponse(int(resp)).name if pd.notna(resp) else "N/A"
+        stim_id = row.get("sample_image")
+        stim_label = str(int(stim_id)) if pd.notna(stim_id) else "N/A"
         info_pane.object = (
             f"### Trial {trial_index}\n"
-            f"**Type:** {ttype} &nbsp;&nbsp; **Behavioral response:** {resp_label}"
+            f"**Type:** {ttype} &nbsp;&nbsp; **Behavioral response:** {resp_label} "
+            f"&nbsp;&nbsp; **Stimulus:** {stim_label}"
         )
 
     sidebar = pn.Column(
@@ -491,6 +522,7 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
         pn.layout.Divider(),
         "## Overlays",
         show_spikes,
+        show_events,
         filter_enabled,
         band_select,
         custom_low,
@@ -515,6 +547,7 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
         trial_select,
         channel_select,
         show_spikes,
+        show_events,
         filter_enabled,
         band_select,
         custom_low,

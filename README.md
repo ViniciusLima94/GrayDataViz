@@ -21,7 +21,9 @@ the session.*
 - **Session picker**: monkey → date → session → cue/match alignment, all
   auto-discovered from disk (see [Loading API](#loading-api) below).
 - **Trial**: pick any trial; the dropdown shows its type and behavioral
-  response inline (e.g. "Trial 99 — TASK, CORRECT").
+  response inline (e.g. "Trial 99 — TASK, CORRECT"), and the info line above
+  the LFP trace adds the trial's stimulus id (raw `sample_image` value from
+  `trial_info`, 1-5, or N/A for fixation trials).
 - **Channel(s)**: select **one or two** channels from the multi-select
   (`Clear selection` resets it). One channel shows its LFP trace and power
   spectrum. Two channels overlay both LFP traces in one plot and add a
@@ -31,6 +33,10 @@ the session.*
   of them being silently baked in.
 - **Overlay spikes**: adds each channel's spike raster (tick marks) above its
   trace, in that channel's own color.
+- **Show cue onset/offset & match onset**: draws vertical reference lines at
+  the selected trial's `sample_on`/`sample_off`/`match_on` times, converted to
+  the same relative-to-alignment seconds as the plotted trace (no
+  `match_off`/offset field exists in `trial_info`).
 - **Apply bandpass filter**: pick a per-monkey band preset (from
   `phase_coupling_analysis/config.py`'s `bands`) or a custom range. When
   enabled, the filtered signal **replaces** the raw one everywhere (trace,
