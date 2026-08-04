@@ -28,6 +28,7 @@ from .exceptions import RawDataNotFoundError
 from .io import read_hdf5_mat
 from .metadata import load_session_metadata
 from .trials import TrialType
+from .windows import default_evt_dt
 
 AlignTo = Literal["cue", "match"]
 
@@ -37,7 +38,7 @@ def load_session(
     date: str,
     session: int = 1,
     align_to: AlignTo = "cue",
-    evt_dt: tuple[float, float] = (-0.65, 3.00),
+    evt_dt: tuple[float, float] | None = None,
     exclude_slvr_msmod: bool = True,
     only_unique_recordings: bool = False,
     load_spike_times: bool = False,
@@ -54,6 +55,10 @@ def load_session(
         Whether trial windows are cut relative to cue onset or match onset.
     evt_dt:
         `(t_start, t_end)` window (seconds) around the alignment event to keep.
+        Defaults to the monkey/align_to-specific window from
+        `graydataviz.windows.DEFAULT_EVT_DT` -- using another monkey's window
+        (e.g. lucy's on ethyl's data) can slice past the end of a trial's
+        actual recording.
     exclude_slvr_msmod:
         Drop channels flagged with short-latency visual response or
         microsaccade modulation. Matches the default behavior of the previous
@@ -77,6 +82,8 @@ def load_session(
     """
     if align_to not in ("cue", "match"):
         raise ValueError(f'align_to must be "cue" or "match", got {align_to!r}')
+    if evt_dt is None:
+        evt_dt = default_evt_dt(monkey, align_to)
 
     config = config or default_config()
     metadata = load_session_metadata(monkey, date, session, config=config)

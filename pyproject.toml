@@ -23,12 +23,14 @@ dependencies = [
 gui = [
     "panel",
     "matplotlib",
+    "mne",
 ]
 dev = [
     "pytest",
     "pytest-cov",
     "panel",
     "matplotlib",
+    "mne",
 ]
 
 [project.scripts]

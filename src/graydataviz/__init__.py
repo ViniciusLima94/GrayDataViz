@@ -17,6 +17,7 @@ from .metadata import SessionMetadata, load_session_metadata
 from .session import load_session
 from .stimuli import get_stimulus_image, get_stimulus_name
 from .trials import BehavioralResponse, TrialType, filter_trial_indexes
+from .windows import DEFAULT_EVT_DT, default_evt_dt
 
 __all__ = [
     "DataConfig",
@@ -42,4 +43,6 @@ __all__ = [
     "DEFAULT_BANDS",
     "get_stimulus_image",
     "get_stimulus_name",
+    "DEFAULT_EVT_DT",
+    "default_evt_dt",
 ]
