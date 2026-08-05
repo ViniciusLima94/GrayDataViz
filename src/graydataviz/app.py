@@ -7,7 +7,14 @@ top of the raw signal, and see each trace's power spectrum (multitaper,
 matching phase_coupling_analysis's xr_psd_array_multitaper params) below it.
 When two channels are selected, their coherence (multitaper, matching
 phase_coupling_analysis's conn_spec_average params) is shown between the two
-power spectra instead.
+power spectra instead. A Hilbert decomposition panel (envelope and/or
+instantaneous phase, matching phase_coupling_analysis's hilbert_decomposition:
+bandpass filter then scipy.signal.hilbert) can be shown below the LFP trace,
+along with spike-triggered average, phase-amplitude coupling (Tort modulation
+index), and spike-phase locking panels. The LFP trace itself is an interactive
+Bokeh chart (pan/zoom with the mouse, or type a start/end time) rather than a
+static image -- unlike every other plot here, its underlying sample values are
+therefore inspectable via the browser's dev tools.
 
 Run with:
     python -m graydataviz.app
@@ -24,7 +31,11 @@ from matplotlib.figure import Figure
 import numpy as np
 import pandas as pd
 import panel as pn
+from bokeh.models import ColumnDataSource, Span
+from bokeh.plotting import figure as bokeh_figure
 from mne.time_frequency import psd_array_multitaper
+from scipy import stats as scipy_stats
+from scipy.signal import hilbert as scipy_hilbert
 
 from .config import DataConfig, default_config
 from .discovery import list_dates, list_monkeys, list_sessions
@@ -37,11 +48,15 @@ from .trials import BehavioralResponse, TrialType
 pn.extension()
 
 # Validated categorical palette (see the dataviz skill's reference palette):
-# slot 1 blue / slot 2 orange / slot 8 red, so identity stays consistent
-# between the time-domain trace and the power spectrum below it.
+# slot 1 blue / slot 2 orange, so identity stays consistent between the
+# time-domain trace, its spike raster, and the power spectrum below it.
 _COLOR_RAW = "#2a78d6"
 _COLOR_FILTERED = "#eb6834"
-_COLOR_SPIKES = "#e34948"
+
+# Raw recordings are in volts; phase_coupling_analysis/util.py's
+# load_session_data multiplies by this same factor before anything is
+# plotted or analyzed, so we match that convention here too.
+_VOLTS_TO_MICROVOLTS = 1e6
 
 # Multitaper PSD params, matching phase_coupling_analysis/src/metrics/spectral.py's
 # xr_psd_array_multitaper defaults.
@@ -55,6 +70,30 @@ _PSD_FMAX = 80.0
 _COH_BANDWIDTH = 5.0
 _COH_FMIN = 0.1
 _COH_FMAX = 80.0
+
+_PAC_N_BINS = 18
+_SPIKE_PHASE_N_BINS = 18
+_STA_HALF_WINDOW = 0.25  # seconds
+
+# Power-product quantile regions & phase-difference circular plot, matching
+# plot_phase_coupling_analysis/notebooks/Phase_Analysis-Method_Sumary.ipynb:
+# quartiles of the pooled (all trials, all times) element-wise product of two
+# channels' Hilbert power (envelope squared) -- the same quantity
+# save_burst_trains.py thresholds for burst detection.
+_QUANTILE_EDGES = np.array([0.0, 0.25, 0.50, 0.75, 1.0])
+_QUANTILE_LABELS = ["Q1 (0-25%)", "Q2 (25-50%)", "Q3 (50-75%)", "Q4 (75-100%)"]
+# Palette slots 3/4/6/7 (aqua/yellow/green/violet) -- slots 1/2/8
+# (blue/orange/red) are already channel-1/channel-2/spikes identity colors.
+_QUANTILE_COLORS = ["#1baf7a", "#eda100", "#008300", "#4a3aa7"]
+_CIRCULAR_HIST_BINS = 16
+
+# Full 8-slot categorical order, assigned in fixed order to stimulus groups
+# when 2+ stimuli are selected in the trial-subset filter (PSD/coherence/STA
+# overlay one line per stimulus instead of channel identity in that case).
+_STIMULUS_COLORS = [
+    "#2a78d6", "#eb6834", "#1baf7a", "#eda100",
+    "#e87ba4", "#008300", "#4a3aa7", "#e34948",
+]
 
 
 def _psd_all_trials(x: np.ndarray, fsample: float) -> tuple[np.ndarray, np.ndarray]:
@@ -102,6 +141,145 @@ def _coherence_all_trials(
     return freqs, coh
 
 
+def _hilbert_analytic(x: np.ndarray, fsample: float, low: float, high: float) -> np.ndarray:
+    """Analytic signal for envelope/phase, matching
+    phase_coupling_analysis/src/metrics/phase.py's hilbert_decomposition: that
+    function applies scipy.signal.hilbert to data that's already been
+    band-filtered upstream (in phasedifferences.py), so we filter first too --
+    instantaneous phase/envelope of a broadband signal isn't physically
+    meaningful. Works on `(n_times,)` or `(n_trials, n_times)` -- both
+    bandpass_filter and scipy.signal.hilbert operate independently along the
+    last axis, so trials never bleed into each other.
+    """
+    filtered = bandpass_filter(x, fsample, low, high)
+    return scipy_hilbert(filtered, axis=-1)
+
+
+def _spike_triggered_average(
+    lfp_all_trials: np.ndarray,
+    spikes_all_trials: np.ndarray,
+    fsample: float,
+    half_window: float = _STA_HALF_WINDOW,
+) -> tuple[np.ndarray, np.ndarray] | tuple[None, None]:
+    """Average LFP waveform (same units as `lfp_all_trials`) in a window
+    around every spike, pooled across all trials. Spikes too close to a
+    trial's edge to fit the full window are skipped."""
+    n_half = int(round(half_window * fsample))
+    n_trials, n_times = lfp_all_trials.shape
+    segments = []
+    for tr in range(n_trials):
+        for si in np.where(spikes_all_trials[tr])[0]:
+            start, end = si - n_half, si + n_half
+            if start < 0 or end > n_times:
+                continue
+            segments.append(lfp_all_trials[tr, start:end])
+    if not segments:
+        return None, None
+    sta = np.mean(segments, axis=0)
+    t_rel = np.arange(-n_half, n_half) / fsample
+    return t_rel, sta
+
+
+def _phase_amplitude_bins(
+    phase: np.ndarray, values: np.ndarray, n_bins: int, reduce: str
+) -> tuple[np.ndarray, np.ndarray]:
+    bin_edges = np.linspace(-np.pi, np.pi, n_bins + 1)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    bin_idx = np.clip(np.digitize(phase, bin_edges) - 1, 0, n_bins - 1)
+    out = np.zeros(n_bins)
+    for b in range(n_bins):
+        mask = bin_idx == b
+        if not mask.any():
+            continue
+        out[b] = values[mask].mean() if reduce == "mean" else mask.sum()
+    return bin_centers, out
+
+
+def _pac_modulation_index(
+    x_all_trials: np.ndarray,
+    fsample: float,
+    phase_band: tuple[float, float],
+    amp_band: tuple[float, float],
+    n_bins: int = _PAC_N_BINS,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Tort et al. (2010) modulation index: bin the amplitude envelope of
+    `amp_band` by the phase of `phase_band` (same channel, both derived from
+    `x_all_trials`, pooled across all trials), then MI = (log(n_bins) -
+    Shannon entropy of the resulting distribution) / log(n_bins).
+    """
+    phase = np.angle(_hilbert_analytic(x_all_trials, fsample, *phase_band)).ravel()
+    amplitude = np.abs(_hilbert_analytic(x_all_trials, fsample, *amp_band)).ravel()
+
+    bin_centers, mean_amp = _phase_amplitude_bins(phase, amplitude, n_bins, reduce="mean")
+    total = mean_amp.sum()
+    p = mean_amp / total if total > 0 else np.full(n_bins, 1.0 / n_bins)
+    p_safe = np.where(p > 0, p, 1.0)  # log(1) = 0, contributes nothing -- avoids log(0)
+    entropy = -np.sum(p * np.log(p_safe))
+    mi = (np.log(n_bins) - entropy) / np.log(n_bins)
+    return bin_centers, mean_amp, float(mi)
+
+
+def _spike_phase_locking(
+    x_all_trials: np.ndarray,
+    spikes_all_trials: np.ndarray,
+    fsample: float,
+    band: tuple[float, float],
+    n_bins: int = _SPIKE_PHASE_N_BINS,
+) -> tuple[np.ndarray, np.ndarray, float] | tuple[None, None, None]:
+    """Phase (in `band`) at every spike, pooled across all trials: returns a
+    normalized spike-phase histogram plus the mean resultant length (vector
+    strength `R`, 0 = no locking, 1 = perfect locking).
+    """
+    phase_all = np.angle(_hilbert_analytic(x_all_trials, fsample, *band))
+    spike_phases = phase_all[spikes_all_trials.astype(bool)]
+    if spike_phases.size == 0:
+        return None, None, None
+    resultant = float(np.abs(np.mean(np.exp(1j * spike_phases))))
+    bin_centers, counts = _phase_amplitude_bins(
+        spike_phases, np.ones_like(spike_phases), n_bins, reduce="count"
+    )
+    density = counts / counts.sum() if counts.sum() > 0 else counts
+    return bin_centers, density, resultant
+
+
+def _rank_percentile(x: np.ndarray) -> np.ndarray:
+    """Percentile rank (0-1) of every value in `x`, pooled across the whole
+    array (not row-wise) -- `scipy.stats.rankdata` handles ties."""
+    flat = x.ravel()
+    return (scipy_stats.rankdata(flat) / flat.size).reshape(x.shape)
+
+
+def _quantile_thresholds(x: np.ndarray, edges: np.ndarray = _QUANTILE_EDGES) -> np.ndarray:
+    return np.quantile(x.ravel(), edges)
+
+
+def _phase_difference_all_trials(analytic1: np.ndarray, analytic2: np.ndarray) -> np.ndarray:
+    diff = np.angle(analytic1) - np.angle(analytic2)
+    return (diff + np.pi) % (2 * np.pi) - np.pi
+
+
+def _circular_hist(
+    ax, x: np.ndarray, bins: int = _CIRCULAR_HIST_BINS, color: str = "b", alpha: float = 0.6
+) -> None:
+    """Area-true circular histogram: bin *radius* is set so bin *area* (not
+    radius) is proportional to frequency, which is what makes it read
+    correctly as a density -- a naive radius-proportional histogram visually
+    over-emphasizes high-count bins. Ported from
+    plot_phase_coupling_analysis/notebooks/plot_.py's circular_hist.
+    """
+    x = (x + np.pi) % (2 * np.pi) - np.pi
+    bin_edges = np.linspace(-np.pi, np.pi, bins + 1)
+    counts, bin_edges = np.histogram(x, bins=bin_edges)
+    widths = np.diff(bin_edges)
+    area = counts / x.size if x.size else counts.astype(float)
+    radius = np.sqrt(area / np.pi)
+    ax.bar(
+        bin_edges[:-1], radius, width=widths, align="edge",
+        edgecolor="k", fill=True, linewidth=1, alpha=alpha, color=color,
+    )
+    ax.set_yticks([])
+
+
 @pn.cache
 def _cached_metadata(config: DataConfig, monkey: str, date: str, session: int) -> SessionMetadata:
     return load_session_metadata(monkey, date, session, config=config)
@@ -139,60 +317,6 @@ def _trial_label(trial_info: pd.DataFrame, trial_index: int) -> str:
     return f"Trial {trial_index} — {ttype}, {resp_label}"
 
 
-def _lfp_trace_figure(
-    time: np.ndarray,
-    series: list[dict],
-    spike_series: list[dict],
-    figsize: tuple[float, float],
-    title: str | None = None,
-    event_markers: list[dict] | None = None,
-) -> Figure:
-    """`series`: dicts with `y`, `color`, `linestyle`, `label`.
-    `spike_series`: dicts with `spikes` (bool array), `color`, `label`.
-    `event_markers`: dicts with `time` (seconds, relative to the plotted
-    window), `linestyle`, `label` -- drawn as vertical reference lines in a
-    neutral gray so they read as timing markers, not data series.
-
-    All spike rows sit above the combined range of every plotted trace (not
-    each channel's own range) since they share one y-axis -- otherwise a
-    lower-amplitude channel's spikes would land low enough to sit inside, or
-    below, a higher-amplitude channel's trace. Each row gets its own offset
-    so multiple channels' spikes stack instead of overlapping.
-    """
-    fig = Figure(figsize=figsize)
-    ax = fig.add_subplot(111)
-    for s in series:
-        ax.plot(time, s["y"], color=s["color"], lw=1 if s["linestyle"] == "-" else 1.2,
-                 linestyle=s["linestyle"], label=s["label"])
-    for m in event_markers or []:
-        ax.axvline(m["time"], color="0.4", lw=1, linestyle=m["linestyle"], label=m["label"])
-    if spike_series and series:
-        all_y = np.concatenate([s["y"] for s in series])
-        y_top = all_y.max() + 0.05 * np.ptp(all_y)
-        y_step = 0.05 * np.ptp(all_y)
-        for row, s in enumerate(spike_series):
-            if not s["spikes"].any():
-                continue
-            spike_times = time[s["spikes"]]
-            y = np.full_like(spike_times, y_top + row * y_step)
-            ax.scatter(spike_times, y, marker="|", color=s["color"], label=s["label"])
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("LFP")
-    if title:
-        ax.set_title(title, fontsize=9)
-    handles, labels = ax.get_legend_handles_labels()
-    if handles:
-        ax.legend(
-            handles, labels,
-            loc="lower center",
-            bbox_to_anchor=(0.5, 1.02),
-            ncol=len(labels),
-            frameon=False,
-            fontsize=8,
-        )
-    return fig
-
-
 def _psd_figure(
     series: list[tuple[np.ndarray, np.ndarray, str, str]],
     figsize: tuple[float, float],
@@ -203,11 +327,41 @@ def _psd_figure(
     for freqs, psd, color, label in series:
         ax.plot(freqs, psd, color=color, lw=1.5, label=label)
     ax.set_xlabel("Frequency (Hz)")
-    ax.set_ylabel("Power spectral density")
+    ax.set_ylabel("Power spectral density (µV²/Hz)")
     if title:
         ax.set_title(title, fontsize=9)
     ax.legend(loc="upper right", fontsize=8)
     return fig
+
+
+def _make_linked_time_series_figure(x_range, y_axis_label: str, height: int = 180):
+    """A small Bokeh line-chart factory for panels that should pan/zoom in
+    lockstep with the main LFP chart: sharing `x_range` (the same Bokeh Range
+    object, not a copy) means dragging/scrolling on any one of them moves all
+    of them together.
+    """
+    fig = bokeh_figure(
+        height=height,
+        sizing_mode="stretch_width",
+        x_range=x_range,
+        tools="pan,box_zoom,wheel_zoom,reset,save",
+        active_drag="box_zoom",
+        active_scroll="wheel_zoom",
+        x_axis_label="Time (s)",
+        y_axis_label=y_axis_label,
+    )
+    fig.toolbar.logo = None
+    source_1 = ColumnDataSource(data=dict(x=[], y=[]))
+    source_2 = ColumnDataSource(data=dict(x=[], y=[]))
+    line_1 = fig.line("x", "y", source=source_1, color=_COLOR_RAW, line_width=1.2, legend_label="Channel 1")
+    line_2 = fig.line("x", "y", source=source_2, color=_COLOR_FILTERED, line_width=1.2, legend_label="Channel 2")
+    fig.legend.visible = False
+    fig.legend.click_policy = "hide"
+    fig.legend.background_fill_alpha = 0
+    fig.legend.border_line_alpha = 0
+    fig.legend.orientation = "horizontal"
+    fig.legend.location = "top_left"
+    return fig, (source_1, source_2), (line_1, line_2)
 
 
 def _coherence_figure(
@@ -224,6 +378,78 @@ def _coherence_figure(
     ax.set_ylabel("Coherence")
     ax.set_title(f"Coherence: {label1} vs {label2}", fontsize=9)
     ax.legend(loc="upper right", fontsize=8)
+    return fig
+
+
+def _sta_figure(
+    series: list[tuple[np.ndarray, np.ndarray, str, str, str]], figsize: tuple[float, float]
+) -> Figure:
+    """`series`: (t_rel, sta_wave_uv, color, label, linestyle)."""
+    fig = Figure(figsize=figsize)
+    ax = fig.add_subplot(111)
+    for t_rel, sta, color, label, linestyle in series:
+        ax.plot(t_rel, sta, color=color, lw=1.5, label=label, linestyle=linestyle)
+    ax.axvline(0, color="0.6", lw=0.8, linestyle="--")
+    ax.set_xlabel("Time from spike (s)")
+    ax.set_ylabel("LFP (µV)")
+    ax.set_title("Spike-triggered average", fontsize=9)
+    ax.legend(loc="upper right", fontsize=8)
+    return fig
+
+
+def _phase_bar_figure(
+    results: list[dict],
+    xlabel: str,
+    ylabel: str,
+    title: str,
+    figsize: tuple[float, float],
+) -> Figure:
+    """`results`: dicts with `bin_centers`, `values`, `metric_label`, `color`, `label`."""
+    fig = Figure(figsize=figsize)
+    ax = fig.add_subplot(111)
+    n = max(len(results), 1)
+    full_width = (2 * np.pi / len(results[0]["bin_centers"])) * 0.85 if results else 0.3
+    bar_width = full_width / n
+    for i, r in enumerate(results):
+        offset = (i - (n - 1) / 2) * bar_width
+        ax.bar(
+            r["bin_centers"] + offset, r["values"], width=bar_width,
+            color=r["color"], alpha=0.85, label=f'{r["label"]} ({r["metric_label"]})',
+        )
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title, fontsize=9)
+    ax.set_xticks([-np.pi, 0, np.pi])
+    ax.set_xticklabels(["-π", "0", "π"])
+    ax.legend(loc="upper right", fontsize=7)
+    return fig
+
+
+def _phase_diff_circular_figure(
+    bin_results: list[dict], figsize: tuple[float, float], suptitle: str | None = None
+) -> Figure:
+    """`bin_results`: dicts with `label`, `phases` (1D array, radians), `color`.
+    One polar subplot per bin, side by side, each an area-true circular
+    histogram of the phase difference with its circular mean/std in the
+    title. `suptitle` states the sign convention (phase(A) - phase(B)) used
+    for every subplot -- circular std is sign-symmetric, but the mean/the
+    histogram's orientation flips if A and B are swapped, so this is the
+    only thing that tells you which way round it was computed.
+    """
+    n = max(len(bin_results), 1)
+    fig = Figure(figsize=figsize)
+    if suptitle:
+        fig.suptitle(suptitle, fontsize=8)
+    for i, r in enumerate(bin_results):
+        ax = fig.add_subplot(1, n, i + 1, projection="polar")
+        phases = r["phases"]
+        if phases.size:
+            _circular_hist(ax, phases, color=r["color"])
+            mu_deg = np.degrees(scipy_stats.circmean(phases, high=np.pi, low=-np.pi))
+            std_deg = np.degrees(scipy_stats.circstd(phases, nan_policy="omit"))
+            ax.set_title(f'{r["label"]}\nμ={mu_deg:.1f}°, σ={std_deg:.1f}°', fontsize=9)
+        else:
+            ax.set_title(f'{r["label"]}\n(no samples)', fontsize=9)
     return fig
 
 
@@ -248,22 +474,151 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
     unique_recordings_only = pn.widgets.Checkbox(
         label="Unique recordings only", value=False
     )
+
+    zoom_start = pn.widgets.FloatInput(label="Zoom start (s)", value=0.0)
+    zoom_end = pn.widgets.FloatInput(label="Zoom end (s)", value=0.0)
+    reset_zoom_button = pn.widgets.Button(label="Reset zoom")
+
     show_spikes = pn.widgets.Checkbox(label="Overlay spikes", value=False)
     show_events = pn.widgets.Checkbox(label="Show cue onset/offset & match onset", value=False)
     filter_enabled = pn.widgets.Checkbox(label="Apply bandpass filter", value=False)
+    hilbert_mode = pn.widgets.Select(
+        label="Hilbert decomposition (uses the band below)",
+        options=["None", "Envelope", "Phase", "Envelope + Phase"],
+        value="None",
+    )
     band_select = pn.widgets.Select(label="Band preset", options=["custom"])
     custom_low = pn.widgets.FloatInput(label="Low (Hz)", value=8.0, start=0.0)
     custom_high = pn.widgets.FloatInput(label="High (Hz)", value=12.0, start=0.1)
 
+    show_sta = pn.widgets.Checkbox(label="Spike-triggered average (µV)", value=False)
+    show_pac = pn.widgets.Checkbox(label="Phase-amplitude coupling (Tort MI)", value=False)
+    pac_phase_low = pn.widgets.FloatInput(label="PAC phase band low (Hz)", value=4.0, start=0.0)
+    pac_phase_high = pn.widgets.FloatInput(label="PAC phase band high (Hz)", value=8.0, start=0.1)
+    pac_amp_low = pn.widgets.FloatInput(label="PAC amplitude band low (Hz)", value=30.0, start=0.0)
+    pac_amp_high = pn.widgets.FloatInput(label="PAC amplitude band high (Hz)", value=80.0, start=0.1)
+    show_spike_phase = pn.widgets.Checkbox(
+        label="Spike-phase locking (uses the band above)", value=False
+    )
+    show_quantile_regions = pn.widgets.Checkbox(
+        label="Power-product quantile regions (2 channels, uses the band above)", value=False
+    )
+    phase_diff_bins = pn.widgets.MultiSelect(
+        label="Phase-difference circular plot: quantile bin(s)",
+        options=_QUANTILE_LABELS, value=[], size=4,
+    )
+
+    trial_type_filter = pn.widgets.MultiSelect(
+        label="Trial type (none = all)",
+        options=[t.name for t in TrialType], value=[], size=3,
+    )
+    behavioral_response_filter = pn.widgets.MultiSelect(
+        label="Behavioral response (none = all)",
+        options=[r.name for r in BehavioralResponse], value=[], size=2,
+    )
+    stimulus_filter = pn.widgets.MultiSelect(
+        label="Stimulus label (none = all)", options=[], value=[], size=5,
+    )
+    clear_trial_subset_button = pn.widgets.Button(label="Clear selection")
+    subset_info_pane = pn.pane.Markdown("", styles={"font-size": "0.85em", "color": "#666"})
+
     info_pane = pn.pane.Markdown("")
-    lfp_pane = pn.pane.Matplotlib(Figure(), tight=True, sizing_mode="stretch_width")
+
+    lfp_bokeh = bokeh_figure(
+        height=350,
+        sizing_mode="stretch_width",
+        tools="pan,box_zoom,wheel_zoom,reset,save",
+        active_drag="box_zoom",
+        active_scroll="wheel_zoom",
+        x_axis_label="Time (s)",
+        y_axis_label="LFP (µV)",
+    )
+    lfp_bokeh.toolbar.logo = None
+    lfp_source_1 = ColumnDataSource(data=dict(x=[], y=[]))
+    lfp_source_2 = ColumnDataSource(data=dict(x=[], y=[]))
+    lfp_line_1 = lfp_bokeh.line("x", "y", source=lfp_source_1, color=_COLOR_RAW, line_width=1.2, legend_label="Channel 1")
+    lfp_line_2 = lfp_bokeh.line("x", "y", source=lfp_source_2, color=_COLOR_FILTERED, line_width=1.2, legend_label="Channel 2")
+    spike_source_1 = ColumnDataSource(data=dict(x=[], y=[]))
+    spike_source_2 = ColumnDataSource(data=dict(x=[], y=[]))
+    # Each channel's spikes are colored to match that channel's own LFP line
+    # (same convention as the old matplotlib rendering) -- both used to be
+    # hardcoded to the same red, which made channel 2's row (only ~5% of the
+    # y-range above channel 1's) very easy to miss, especially when spike
+    # times correlate between the two channels.
+    spike_scatter_1 = lfp_bokeh.scatter(
+        "x", "y", source=spike_source_1, marker="dash", size=14, angle=1.5708,
+        color=_COLOR_RAW, legend_label="Ch1 spikes",
+    )
+    spike_scatter_2 = lfp_bokeh.scatter(
+        "x", "y", source=spike_source_2, marker="dash", size=14, angle=1.5708,
+        color=_COLOR_FILTERED, legend_label="Ch2 spikes",
+    )
+    event_spans = {
+        "cue_on": Span(location=0, dimension="height", line_color="gray", line_dash="solid", line_width=1),
+        "cue_off": Span(location=0, dimension="height", line_color="gray", line_dash="dashed", line_width=1),
+        "match_on": Span(location=0, dimension="height", line_color="gray", line_dash="dotted", line_width=1),
+    }
+    for span in event_spans.values():
+        span.visible = False
+        lfp_bokeh.add_layout(span)
+    lfp_bokeh.legend.visible = False
+    lfp_bokeh.legend.click_policy = "hide"
+    lfp_bokeh.legend.background_fill_alpha = 0
+    lfp_bokeh.legend.border_line_alpha = 0
+    lfp_bokeh.legend.orientation = "horizontal"
+    lfp_bokeh.legend.location = "top_left"
+    lfp_pane = pn.pane.Bokeh(lfp_bokeh)
+
     psd_pane = pn.pane.Matplotlib(Figure(figsize=(4, 3)), tight=True, sizing_mode="stretch_width")
     psd_pane_2 = pn.pane.Matplotlib(Figure(figsize=(4, 3)), tight=True, sizing_mode="stretch_width")
     coherence_pane = pn.pane.Matplotlib(
         Figure(figsize=(4, 3)), tight=True, sizing_mode="stretch_width"
     )
+    envelope_bokeh, envelope_sources, envelope_lines = _make_linked_time_series_figure(
+        lfp_bokeh.x_range, "Envelope (µV)"
+    )
+    envelope_pane = pn.pane.Bokeh(envelope_bokeh)
+    phase_bokeh, phase_sources, phase_lines = _make_linked_time_series_figure(
+        lfp_bokeh.x_range, "Phase (rad)", height=150
+    )
+    phase_bokeh.y_range.start, phase_bokeh.y_range.end = -np.pi, np.pi
+    phase_pane = pn.pane.Bokeh(phase_bokeh)
 
-    state: dict = {"metadata": None, "ds": None, "spectral_cache": {}}
+    quantile_bokeh = bokeh_figure(
+        height=180,
+        sizing_mode="stretch_width",
+        x_range=lfp_bokeh.x_range,
+        tools="pan,box_zoom,wheel_zoom,reset,save",
+        active_drag="box_zoom",
+        active_scroll="wheel_zoom",
+        x_axis_label="Time (s)",
+        y_axis_label="Power-product percentile",
+    )
+    quantile_bokeh.toolbar.logo = None
+    percentile_source = ColumnDataSource(data=dict(x=[], y=[]))
+    quantile_bokeh.line(
+        "x", "y", source=percentile_source, color="#666666", line_width=1.2, legend_label="percentile"
+    )
+    quantile_band_sources = [ColumnDataSource(data=dict(x=[], y=[])) for _ in range(4)]
+    for i in range(4):
+        quantile_bokeh.line(
+            "x", "y", source=quantile_band_sources[i], color=_QUANTILE_COLORS[i],
+            line_width=5, legend_label=_QUANTILE_LABELS[i],
+        )
+    quantile_bokeh.legend.click_policy = "hide"
+    quantile_bokeh.legend.background_fill_alpha = 0
+    quantile_bokeh.legend.border_line_alpha = 0
+    quantile_bokeh.legend.orientation = "horizontal"
+    quantile_bokeh.legend.location = "top_left"
+    quantile_bokeh.legend.label_text_font_size = "8pt"
+    quantile_pane = pn.pane.Bokeh(quantile_bokeh)
+
+    sta_pane = pn.pane.Matplotlib(Figure(figsize=(4, 3)), tight=True, sizing_mode="stretch_width")
+    pac_pane = pn.pane.Matplotlib(Figure(figsize=(4, 3)), tight=True, sizing_mode="stretch_width")
+    spike_phase_pane = pn.pane.Matplotlib(Figure(figsize=(4, 3)), tight=True, sizing_mode="stretch_width")
+    phase_diff_pane = pn.pane.Matplotlib(Figure(figsize=(4, 3)), tight=True, sizing_mode="stretch_width")
+
+    state: dict = {"metadata": None, "ds": None, "spectral_cache": {}, "full_range": (0.0, 0.0)}
 
     def _update_dates(_event=None):
         dates = list_dates(monkey_select.value, config) if monkey_select.value else []
@@ -297,6 +652,23 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
 
     def _clear_channel_selection(_event=None):
         channel_select.value = []
+
+    def _clear_trial_subset(_event=None):
+        trial_type_filter.value = []
+        behavioral_response_filter.value = []
+        stimulus_filter.value = []
+
+    def _reset_zoom(_event=None):
+        start, end = state["full_range"]
+        lfp_bokeh.x_range.start = start
+        lfp_bokeh.x_range.end = end
+        zoom_start.value = start
+        zoom_end.value = end
+
+    def _apply_zoom(_event=None):
+        if zoom_end.value > zoom_start.value:
+            lfp_bokeh.x_range.start = zoom_start.value
+            lfp_bokeh.x_range.end = zoom_end.value
 
     def _reload_session(_event=None):
         if not (monkey_select.value and date_select.value and session_select.value):
@@ -335,7 +707,15 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
         channel_select.options = channel_options
         channel_select.value = [next(iter(channel_options.values()))]
 
+        stim_values = sorted(
+            int(v) for v in pd.unique(metadata.trial_info["sample_image"]) if pd.notna(v)
+        )
+        stimulus_filter.options = [str(v) for v in stim_values]
+        stimulus_filter.value = []
+
+        state["full_range"] = (float(ds.time.values[0]), float(ds.time.values[-1]))
         _update_plot()
+        _reset_zoom()
 
     def _update_plot(_event=None):
         ds = state["ds"]
@@ -348,12 +728,28 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
         time = ds.time.values
         fsample = float(ds.attrs["fsample"])
         index_to_label = {i: label for label, i in channel_select.options.items()}
+        channel_colors = {selected[0]: _COLOR_RAW}
+        if len(selected) > 1:
+            channel_colors[selected[1]] = _COLOR_FILTERED
 
+        needs_band = (
+            filter_enabled.value
+            or hilbert_mode.value != "None"
+            or show_spike_phase.value
+            or show_quantile_regions.value
+            or bool(phase_diff_bins.value)
+        )
         band_label = None
         low = high = None
-        if filter_enabled.value:
+        if needs_band:
             low, high = _resolve_band()
             band_label = f"{low:g}-{high:g} Hz"
+
+        hilbert_modes = []
+        if hilbert_mode.value in ("Envelope", "Envelope + Phase"):
+            hilbert_modes.append("Envelope")
+        if hilbert_mode.value in ("Phase", "Envelope + Phase"):
+            hilbert_modes.append("Phase")
 
         def _cached_spectral(key, compute_fn):
             cache = state["spectral_cache"]
@@ -361,33 +757,136 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
                 cache[key] = compute_fn()
             return cache[key]
 
-        def _event_markers_for_trial():
-            # cue onset/offset and match onset, in the same relative-to-align_to
-            # seconds as `time` -- no match-offset field exists in trial_info.
+        def _trial_position():
+            return int(np.where(ds.trials.values == trial_index)[0][0])
+
+        def _event_times_for_trial():
             if not show_events.value:
-                return []
-            pos = int(np.where(ds.trials.values == trial_index)[0][0])
+                return {}
+            pos = _trial_position()
             align_to = ds.attrs["align_to"]
             t0 = (ds.attrs["t_cue_on"] if align_to == "cue" else ds.attrs["t_match_on"])[pos]
-            cue_on = (ds.attrs["t_cue_on"][pos] - t0) / fsample
-            cue_off = (ds.attrs["t_cue_off"][pos] - t0) / fsample
-            match_on = (ds.attrs["t_match_on"][pos] - t0) / fsample
-            return [
-                {"time": cue_on, "linestyle": "-", "label": "cue onset"},
-                {"time": cue_off, "linestyle": "--", "label": "cue offset"},
-                {"time": match_on, "linestyle": ":", "label": "match onset"},
-            ]
+            return {
+                "cue_on": (ds.attrs["t_cue_on"][pos] - t0) / fsample,
+                "cue_off": (ds.attrs["t_cue_off"][pos] - t0) / fsample,
+                "match_on": (ds.attrs["t_match_on"][pos] - t0) / fsample,
+            }
 
         def _all_trials_raw(ch_idx):
-            return ds.lfp.isel(roi=ch_idx).values  # (n_trials, n_times)
+            return ds.lfp.isel(roi=ch_idx).values * _VOLTS_TO_MICROVOLTS  # (n_trials, n_times)
 
         def _all_trials_filtered(ch_idx):
             return bandpass_filter(_all_trials_raw(ch_idx), fsample, low, high)
 
+        def _all_trials_spikes(ch_idx):
+            return ds.spikes.isel(roi=ch_idx).values.astype(bool) if "spikes" in ds else None
+
+        def _burst_window_mask() -> np.ndarray:
+            # Matches phase_coupling_analysis/save_burst_trains.py's
+            # trials_length_mask exactly: for the power-product quantile
+            # thresholds and the phase-difference circular histogram (NOT
+            # PSD/coherence/STA/PAC/spike-phase, which pool the full window),
+            # only samples from -0.5s through that trial's own match onset
+            # are valid -- everything before that, or the padding after each
+            # trial's actual behavioral event, is excluded. Without this the
+            # quantile thresholds/phase-difference std come out systematically
+            # different from the reference pipeline's saved outputs.
+            align_to = ds.attrs["align_to"]
+            t0 = ds.attrs["t_cue_on"] if align_to == "cue" else ds.attrs["t_match_on"]
+            match_on_rel = (ds.attrs["t_match_on"] - t0) / fsample  # (n_trials,)
+            return (time[None, :] >= -0.5) & (time[None, :] <= match_on_rel[:, None])
+
+        def _trial_type_behavior_mask() -> np.ndarray:
+            rows = metadata.trial_info.iloc[ds.trials.values]
+            mask = np.ones(len(rows), dtype=bool)
+            if trial_type_filter.value:
+                codes = [TrialType[t].value for t in trial_type_filter.value]
+                mask &= rows["trial_type"].isin(codes).to_numpy()
+            if behavioral_response_filter.value:
+                codes = [BehavioralResponse[r].value for r in behavioral_response_filter.value]
+                mask &= rows["behavioral_response"].isin(codes).to_numpy()
+            return mask
+
+        def _trial_subset_mask() -> np.ndarray:
+            if not (trial_type_filter.value or behavioral_response_filter.value or stimulus_filter.value):
+                return np.ones(len(ds.trials), dtype=bool)
+            mask = _trial_type_behavior_mask()
+            if stimulus_filter.value:
+                rows = metadata.trial_info.iloc[ds.trials.values]
+                codes = [int(s) for s in stimulus_filter.value]
+                mask &= rows["sample_image"].isin(codes).to_numpy()
+            return mask
+
+        subset_mask = _trial_subset_mask()
+        n_subset = int(subset_mask.sum())
+        subset_note = ""
+        if n_subset == 0:
+            subset_mask = np.ones(len(ds.trials), dtype=bool)
+            n_subset = len(ds.trials)
+            subset_note = " (filter matched 0 trials — showing all trials instead)"
+        subset_signature = (
+            tuple(sorted(trial_type_filter.value)),
+            tuple(sorted(behavioral_response_filter.value)),
+            tuple(sorted(stimulus_filter.value)),
+        )
+
+        def _stimulus_groups() -> list[tuple[str | None, np.ndarray]]:
+            # When 2+ stimuli are selected, split into one (label, mask) pair
+            # per stimulus (each still respecting the trial type/behavioral
+            # response filters) so PSD/coherence/STA/phase-difference can
+            # overlay one curve per stimulus instead of pooling them together.
+            # With 0 or 1 stimuli selected, this is just the ordinary single
+            # combined subset (label=None, same as before this feature).
+            if len(stimulus_filter.value) < 2:
+                return [(None, subset_mask)]
+            base_mask = _trial_type_behavior_mask()
+            rows = metadata.trial_info.iloc[ds.trials.values]
+            groups = []
+            for stim in sorted(stimulus_filter.value, key=int):
+                stim_mask = base_mask & rows["sample_image"].isin([int(stim)]).to_numpy()
+                if stim_mask.sum() > 0:
+                    groups.append((f"Stim {stim}", stim_mask))
+            return groups or [(None, subset_mask)]
+
+        stim_groups = _stimulus_groups()
+        split_by_stimulus = len(stim_groups) > 1
+
+        if split_by_stimulus:
+            counts = ", ".join(f"{label}: {int(mask.sum())}" for label, mask in stim_groups)
+            subset_info_pane.object = (
+                f"*PSD, coherence, STA, and phase-difference are split by stimulus "
+                f"({counts} trials). PAC, spike-phase locking, and the quantile panel "
+                f"still pool all {n_subset}/{len(ds.trials)} matching trials together.*"
+            )
+        else:
+            subset_info_pane.object = (
+                f"*Pooled analyses (PSD, coherence, STA, PAC, spike-phase, quantile/phase-diff) "
+                f"use {n_subset}/{len(ds.trials)} trials.{subset_note}*"
+            )
+
+        def _pooled_trials_raw_for(ch_idx, mask):
+            return _all_trials_raw(ch_idx)[mask]
+
+        def _pooled_trials_filtered_for(ch_idx, mask):
+            return bandpass_filter(_pooled_trials_raw_for(ch_idx, mask), fsample, low, high)
+
+        def _pooled_trials_spikes_for(ch_idx, mask):
+            spikes = _all_trials_spikes(ch_idx)
+            return spikes[mask] if spikes is not None else None
+
+        def _pooled_trials_raw(ch_idx):
+            return _pooled_trials_raw_for(ch_idx, subset_mask)
+
+        def _pooled_trials_filtered(ch_idx):
+            return _pooled_trials_filtered_for(ch_idx, subset_mask)
+
+        def _pooled_trials_spikes(ch_idx):
+            return _pooled_trials_spikes_for(ch_idx, subset_mask)
+
         def _trial_signal(ch_idx):
             # The one selected trial's raw/filtered/spike traces, for the
-            # time-domain plot only -- PSD/coherence use every trial (below).
-            lfp = ds.lfp.sel(trials=trial_index).isel(roi=ch_idx).values
+            # time-domain plot only -- PSD/coherence/STA/PAC use every trial.
+            lfp = ds.lfp.sel(trials=trial_index).isel(roi=ch_idx).values * _VOLTS_TO_MICROVOLTS
             filtered = None
             if filter_enabled.value:
                 try:
@@ -400,62 +899,380 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
             return lfp, filtered, spikes
 
         def _channel_psd_series(ch_idx):
-            # Filtered replaces raw (not layered on top of it) once a filter is applied.
-            if filter_enabled.value:
-                try:
+            # Filtered replaces raw (not layered on top of it) once a filter is
+            # applied. One line per stimulus group when split_by_stimulus,
+            # otherwise the same single raw/filtered line as before.
+            series = []
+            for i, (glabel, gmask) in enumerate(stim_groups):
+                color = _STIMULUS_COLORS[i % len(_STIMULUS_COLORS)] if glabel else None
+                added = False
+                if filter_enabled.value:
+                    try:
+                        freqs, psd = _cached_spectral(
+                            ("psd", ch_idx, "filt", low, high, glabel, subset_signature),
+                            lambda m=gmask: _psd_all_trials(_pooled_trials_filtered_for(ch_idx, m), fsample),
+                        )
+                        label = f"{glabel} filtered {band_label}" if glabel else f"filtered {band_label}"
+                        series.append((freqs, psd, color or _COLOR_FILTERED, label))
+                        added = True
+                    except ValueError as exc:
+                        info_pane.object = f"**Filter error:** {exc}"
+                if not added:
                     freqs, psd = _cached_spectral(
-                        ("psd", ch_idx, "filt", low, high),
-                        lambda: _psd_all_trials(_all_trials_filtered(ch_idx), fsample),
+                        ("psd", ch_idx, "raw", glabel, subset_signature),
+                        lambda m=gmask: _psd_all_trials(_pooled_trials_raw_for(ch_idx, m), fsample),
                     )
-                    return [(freqs, psd, _COLOR_FILTERED, f"filtered {band_label}")]
-                except ValueError as exc:
-                    info_pane.object = f"**Filter error:** {exc}"
-            freqs, psd = _cached_spectral(
-                ("psd", ch_idx, "raw"), lambda: _psd_all_trials(_all_trials_raw(ch_idx), fsample)
-            )
-            return [(freqs, psd, _COLOR_RAW, "raw")]
+                    series.append((freqs, psd, color or _COLOR_RAW, glabel or "raw"))
+            return series
 
         def _channel_coherence_series(ch1_idx, ch2_idx):
-            if filter_enabled.value:
-                try:
+            series = []
+            for i, (glabel, gmask) in enumerate(stim_groups):
+                color = _STIMULUS_COLORS[i % len(_STIMULUS_COLORS)] if glabel else None
+                added = False
+                if filter_enabled.value:
+                    try:
+                        freqs, coh = _cached_spectral(
+                            ("coh", ch1_idx, ch2_idx, "filt", low, high, glabel, subset_signature),
+                            lambda m=gmask: _coherence_all_trials(
+                                _pooled_trials_filtered_for(ch1_idx, m),
+                                _pooled_trials_filtered_for(ch2_idx, m),
+                                fsample,
+                            ),
+                        )
+                        label = f"{glabel} filtered {band_label}" if glabel else f"filtered {band_label}"
+                        series.append((freqs, coh, color or _COLOR_FILTERED, label))
+                        added = True
+                    except ValueError as exc:
+                        info_pane.object = f"**Filter error:** {exc}"
+                if not added:
                     freqs, coh = _cached_spectral(
-                        ("coh", ch1_idx, ch2_idx, "filt", low, high),
-                        lambda: _coherence_all_trials(
-                            _all_trials_filtered(ch1_idx), _all_trials_filtered(ch2_idx), fsample
+                        ("coh", ch1_idx, ch2_idx, "raw", glabel, subset_signature),
+                        lambda m=gmask: _coherence_all_trials(
+                            _pooled_trials_raw_for(ch1_idx, m), _pooled_trials_raw_for(ch2_idx, m), fsample
                         ),
                     )
-                    return [(freqs, coh, _COLOR_FILTERED, f"filtered {band_label}")]
+                    series.append((freqs, coh, color or _COLOR_RAW, glabel or "raw"))
+            return series
+
+        def _update_hilbert_panes(channel_specs) -> list:
+            # channel_specs: list of up to 2 raw signals (µV). Returns the list
+            # of panel(s) to show (0, 1, or 2 of envelope_pane/phase_pane,
+            # matching hilbert_mode) -- both are linked in x-range to the LFP
+            # chart, so zooming either one zooms all of them together.
+            if not hilbert_modes:
+                return []
+            try:
+                analytics = [_hilbert_analytic(raw, fsample, low, high) for raw in channel_specs]
+            except ValueError as exc:
+                info_pane.object = f"**Hilbert error:** {exc}"
+                return []
+
+            def _fill(sources, lines, values):
+                for i in range(2):
+                    if i < len(values):
+                        sources[i].data = dict(x=time, y=values[i])
+                        lines[i].visible = True
+                    else:
+                        sources[i].data = dict(x=[], y=[])
+                        lines[i].visible = False
+
+            panes = []
+            if "Envelope" in hilbert_modes:
+                _fill(envelope_sources, envelope_lines, [np.abs(a) for a in analytics])
+                envelope_bokeh.legend.visible = len(analytics) > 1
+                panes.append(envelope_pane)
+            if "Phase" in hilbert_modes:
+                _fill(phase_sources, phase_lines, [np.angle(a) for a in analytics])
+                phase_bokeh.legend.visible = len(analytics) > 1
+                panes.append(phase_pane)
+            return panes
+
+        def _update_sta_pane() -> bool:
+            if not show_sta.value:
+                return False
+            series = []
+            for ch_idx in selected:
+                # Solid for the first selected channel, dashed for the second
+                # -- only matters when split_by_stimulus, where color is used
+                # for stimulus identity instead of channel identity.
+                linestyle = "-" if ch_idx == selected[0] else "--"
+                for i, (glabel, gmask) in enumerate(stim_groups):
+                    spikes_all = _pooled_trials_spikes_for(ch_idx, gmask)
+                    if spikes_all is None or spikes_all.size == 0:
+                        continue
+                    # Filtered replaces raw here too, once a filter is applied.
+                    if filter_enabled.value:
+                        try:
+                            lfp_all = _pooled_trials_filtered_for(ch_idx, gmask)
+                        except ValueError as exc:
+                            info_pane.object = f"**STA error:** {exc}"
+                            continue
+                        cache_key = ("sta", ch_idx, "filt", low, high, glabel, subset_signature)
+                        suffix = f" filtered {band_label}"
+                    else:
+                        lfp_all = _pooled_trials_raw_for(ch_idx, gmask)
+                        cache_key = ("sta", ch_idx, "raw", glabel, subset_signature)
+                        suffix = ""
+                    t_rel, sta = _cached_spectral(
+                        cache_key,
+                        lambda a=lfp_all, s=spikes_all: _spike_triggered_average(a, s, fsample),
+                    )
+                    if sta is None:
+                        continue
+                    if split_by_stimulus:
+                        color = _STIMULUS_COLORS[i % len(_STIMULUS_COLORS)]
+                        label = f"{index_to_label[ch_idx]} — {glabel}{suffix}"
+                        series.append((t_rel, sta, color, label, linestyle))
+                    else:
+                        label = f"{index_to_label[ch_idx]}{suffix}"
+                        series.append((t_rel, sta, channel_colors[ch_idx], label, "-"))
+            if not series:
+                return False
+            sta_pane.object = _sta_figure(series, figsize=(4, 3))
+            return True
+
+        def _update_pac_pane() -> bool:
+            if not show_pac.value:
+                return False
+            phase_band = (pac_phase_low.value, pac_phase_high.value)
+            amp_band = (pac_amp_low.value, pac_amp_high.value)
+            results = []
+            for ch_idx in selected:
+                try:
+                    bin_centers, mean_amp, mi = _cached_spectral(
+                        ("pac", ch_idx, phase_band, amp_band, subset_signature),
+                        lambda ch=ch_idx: _pac_modulation_index(
+                            _pooled_trials_raw(ch), fsample, phase_band, amp_band
+                        ),
+                    )
                 except ValueError as exc:
-                    info_pane.object = f"**Filter error:** {exc}"
-            freqs, coh = _cached_spectral(
-                ("coh", ch1_idx, ch2_idx, "raw"),
-                lambda: _coherence_all_trials(
-                    _all_trials_raw(ch1_idx), _all_trials_raw(ch2_idx), fsample
-                ),
+                    info_pane.object = f"**PAC error:** {exc}"
+                    return False
+                results.append({
+                    "bin_centers": bin_centers, "values": mean_amp,
+                    "metric_label": f"MI={mi:.3f}",
+                    "color": channel_colors[ch_idx], "label": index_to_label[ch_idx],
+                })
+            pac_pane.object = _phase_bar_figure(
+                results, "Phase (rad)", "Mean amplitude (µV)",
+                f"PAC: phase {phase_band[0]:g}-{phase_band[1]:g} Hz / amp {amp_band[0]:g}-{amp_band[1]:g} Hz",
+                figsize=(4, 3),
             )
-            return [(freqs, coh, _COLOR_RAW, "raw")]
+            return True
+
+        def _update_spike_phase_pane() -> bool:
+            if not show_spike_phase.value:
+                return False
+            results = []
+            for ch_idx in selected:
+                spikes_all = _pooled_trials_spikes(ch_idx)
+                if spikes_all is None:
+                    continue
+                try:
+                    bin_centers, density, r = _cached_spectral(
+                        ("spike_phase", ch_idx, low, high, subset_signature),
+                        lambda ch=ch_idx, s=spikes_all: _spike_phase_locking(
+                            _pooled_trials_raw(ch), s, fsample, (low, high)
+                        ),
+                    )
+                except ValueError as exc:
+                    info_pane.object = f"**Spike-phase error:** {exc}"
+                    return False
+                if bin_centers is None:
+                    continue
+                results.append({
+                    "bin_centers": bin_centers, "values": density,
+                    "metric_label": f"R={r:.3f}",
+                    "color": channel_colors[ch_idx], "label": index_to_label[ch_idx],
+                })
+            if not results:
+                return False
+            spike_phase_pane.object = _phase_bar_figure(
+                results, "Spike phase (rad)", "Spike probability",
+                f"Spike-phase locking ({band_label})", figsize=(4, 3),
+            )
+            return True
+
+        def _quantile_data(ch1_idx, ch2_idx):
+            # Power product of both channels' Hilbert power (envelope
+            # squared) for EVERY trial (same quantity save_burst_trains.py
+            # thresholds for burst detection), but the quartile thresholds and
+            # percentile rank are computed only from samples that are both in
+            # the trial-subset filter AND inside the -0.5s-to-match-onset
+            # burst window (_burst_window_mask) -- so the currently selected
+            # trial (which may or may not be in that subset/window) can still
+            # be displayed against them. Returns (product, percentile-rank,
+            # quartile thresholds): product and percentile are (n_trials,
+            # n_times) over ALL trials, thresholds are 5 edge values.
+            def _compute():
+                p1 = np.abs(_hilbert_analytic(_all_trials_raw(ch1_idx), fsample, low, high)) ** 2
+                p2 = np.abs(_hilbert_analytic(_all_trials_raw(ch2_idx), fsample, low, high)) ** 2
+                product = p1 * p2
+                valid_subset = subset_mask[:, None] & _burst_window_mask()
+                thrs = _quantile_thresholds(product[valid_subset])
+                sorted_subset = np.sort(product[valid_subset].ravel())
+                percentile = (
+                    np.searchsorted(sorted_subset, product.ravel(), side="right")
+                    / sorted_subset.size
+                ).reshape(product.shape)
+                return product, percentile, thrs
+            return _cached_spectral(
+                ("quantile", ch1_idx, ch2_idx, low, high, subset_signature), _compute
+            )
+
+        def _phase_diff_all(ch1_idx, ch2_idx):
+            def _compute():
+                a1 = _hilbert_analytic(_all_trials_raw(ch1_idx), fsample, low, high)
+                a2 = _hilbert_analytic(_all_trials_raw(ch2_idx), fsample, low, high)
+                return _phase_difference_all_trials(a1, a2)
+            return _cached_spectral(("phase_diff_all", ch1_idx, ch2_idx, low, high), _compute)
+
+        def _update_quantile_pane(ch1_idx, ch2_idx) -> bool:
+            if not show_quantile_regions.value:
+                return False
+            try:
+                product, percentile, thrs = _quantile_data(ch1_idx, ch2_idx)
+            except ValueError as exc:
+                info_pane.object = f"**Quantile error:** {exc}"
+                return False
+            pos = _trial_position()
+            percentile_source.data = dict(x=time, y=percentile[pos])
+            trial_product = product[pos]
+            for i in range(4):
+                lo, hi = thrs[i], thrs[i + 1]
+                mask = (trial_product >= lo) & (trial_product <= hi if i == 3 else trial_product < hi)
+                y = np.where(mask, 1.05 + i * 0.08, np.nan)
+                quantile_band_sources[i].data = dict(x=time, y=y)
+            return True
+
+        def _roi_channel_key(ch_idx) -> str:
+            return f"{ds.roi.values[ch_idx]}_{ds.attrs['channels_labels'][ch_idx]}"
+
+        def _canonical_phase_diff_pair(ch1_idx, ch2_idx):
+            # phase_coupling_analysis's pairwise phase-difference (the
+            # reference this panel is meant to match) always orders each
+            # channel pair alphabetically by "{roi}_{channel}" and computes
+            # phase(first) - phase(second) -- not by which channel the user
+            # happened to pick first here. Circular std doesn't care about
+            # sign, but the mean/the histogram's orientation flips if this
+            # isn't matched, which is why it needs to be pinned down rather
+            # than just using (ch1_idx, ch2_idx) as selected.
+            if _roi_channel_key(ch1_idx) <= _roi_channel_key(ch2_idx):
+                return ch1_idx, ch2_idx
+            return ch2_idx, ch1_idx
+
+        def _update_phase_diff_pane(ch1_idx, ch2_idx) -> bool:
+            if not phase_diff_bins.value:
+                return False
+            pd_ch1, pd_ch2 = _canonical_phase_diff_pair(ch1_idx, ch2_idx)
+            try:
+                product, _unused, thrs = _quantile_data(ch1_idx, ch2_idx)
+                phase_diff_all = _phase_diff_all(pd_ch1, pd_ch2)
+            except ValueError as exc:
+                info_pane.object = f"**Phase-difference error:** {exc}"
+                return False
+            # Quartile thresholds are always computed from the full (possibly
+            # stimulus-combined) trial subset -- see _quantile_data -- so Q1-Q4
+            # mean the same power-product regime across stimulus groups. When
+            # split_by_stimulus, one polar subplot per (stimulus, quantile
+            # bin) combination is added, all side by side in the same row
+            # (_phase_diff_circular_figure lays out a flat list that way).
+            window_mask = _burst_window_mask()
+            results = []
+            for glabel, gmask in stim_groups:
+                product_g = product[gmask]
+                phase_diff_g = phase_diff_all[gmask]
+                window_g = window_mask[gmask]
+                for label in phase_diff_bins.value:
+                    i = _QUANTILE_LABELS.index(label)
+                    lo, hi = thrs[i], thrs[i + 1]
+                    mask = (
+                        (product_g >= lo) & (product_g <= hi if i == 3 else product_g < hi) & window_g
+                    )
+                    entry_label = f"{glabel} · {label}" if glabel else label
+                    results.append(
+                        {"label": entry_label, "phases": phase_diff_g[mask], "color": _QUANTILE_COLORS[i]}
+                    )
+            phase_diff_pane.object = _phase_diff_circular_figure(
+                results, figsize=(2.6 * len(results), 3),
+                suptitle=f"Δφ = phase({index_to_label[pd_ch1]}) − phase({index_to_label[pd_ch2]})",
+            )
+            return True
+
+        def _update_lfp_bokeh(series, spike_channels, event_times):
+            # series: list of up to 2 dicts {y, label}. spike_channels: same
+            # length list of (bool array or None).
+            sources = (lfp_source_1, lfp_source_2)
+            lines = (lfp_line_1, lfp_line_2)
+            spike_sources = (spike_source_1, spike_source_2)
+            spike_scatters = (spike_scatter_1, spike_scatter_2)
+
+            all_y = []
+            for i in range(2):
+                if i < len(series):
+                    y = series[i]["y"]
+                    sources[i].data = dict(x=time, y=y)
+                    lines[i].visible = True
+                    all_y.append(y)
+                else:
+                    sources[i].data = dict(x=[], y=[])
+                    lines[i].visible = False
+
+            y_top = y_step = 0.0
+            if all_y:
+                combined = np.concatenate(all_y)
+                span = np.ptp(combined) if len(combined) else 1.0
+                y_top = combined.max() + 0.08 * span
+                y_step = 0.08 * span
+
+            for i in range(2):
+                spikes = spike_channels[i] if i < len(spike_channels) else None
+                if spikes is not None and spikes.any():
+                    spike_times = time[spikes]
+                    spike_sources[i].data = dict(x=spike_times, y=np.full_like(spike_times, y_top + i * y_step))
+                    spike_scatters[i].visible = True
+                else:
+                    spike_sources[i].data = dict(x=[], y=[])
+                    spike_scatters[i].visible = False
+
+            for key, sp in event_spans.items():
+                t = event_times.get(key)
+                if t is not None:
+                    sp.location = t
+                    sp.visible = True
+                else:
+                    sp.visible = False
+
+            lfp_bokeh.legend.visible = len(series) > 1
 
         if len(selected) == 1:
             ch_idx = selected[0]
             lfp, filtered, spikes = _trial_signal(ch_idx)
 
             # Filtered replaces raw (not layered on top of it) once a filter is applied.
-            if filtered is not None:
-                trace, trace_label = filtered, f"filtered {band_label}"
-            else:
-                trace, trace_label = lfp, "raw"
-            series = [{"y": trace, "color": _COLOR_RAW, "linestyle": "-", "label": trace_label}]
-            spike_series = (
-                [{"spikes": spikes, "color": _COLOR_SPIKES, "label": "spikes"}]
-                if spikes is not None
-                else []
-            )
-            lfp_pane.object = _lfp_trace_figure(
-                time, series, spike_series, figsize=(8, 3), event_markers=_event_markers_for_trial()
+            trace = filtered if filtered is not None else lfp
+            _update_lfp_bokeh(
+                [{"y": trace, "label": "signal"}], [spikes], _event_times_for_trial()
             )
 
             psd_pane.object = _psd_figure(_channel_psd_series(ch_idx), figsize=(4, 3))
-            main.objects = [info_pane, lfp_pane, psd_pane]
+
+            hilbert_panes = _update_hilbert_panes([lfp])
+            extras = []
+            if _update_sta_pane():
+                extras.append(sta_pane)
+            if _update_pac_pane():
+                extras.append(pac_pane)
+            if _update_spike_phase_pane():
+                extras.append(spike_phase_pane)
+
+            main.objects = (
+                [info_pane, lfp_pane]
+                + hilbert_panes
+                + ([pn.Row(*extras, sizing_mode="stretch_width")] if extras else [])
+                + [psd_pane]
+            )
         else:
             ch1_idx, ch2_idx = selected
             label1, label2 = index_to_label[ch1_idx], index_to_label[ch2_idx]
@@ -465,22 +1282,10 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
             trace1, trace2 = (filt1, filt2) if filter_enabled.value else (lfp1, lfp2)
             trace1 = lfp1 if trace1 is None else trace1  # filter error fallback
             trace2 = lfp2 if trace2 is None else trace2
-            suffix = f"filtered {band_label}" if filter_enabled.value else "raw"
-            series = [
-                {"y": trace1, "color": _COLOR_RAW, "linestyle": "-", "label": f"{label1} {suffix}"},
-                {"y": trace2, "color": _COLOR_FILTERED, "linestyle": "-", "label": f"{label2} {suffix}"},
-            ]
-            spike_series = []
-            if spk1 is not None:
-                spike_series.append(
-                    {"spikes": spk1, "color": _COLOR_RAW, "label": f"{label1} spikes"}
-                )
-            if spk2 is not None:
-                spike_series.append(
-                    {"spikes": spk2, "color": _COLOR_FILTERED, "label": f"{label2} spikes"}
-                )
-            lfp_pane.object = _lfp_trace_figure(
-                time, series, spike_series, figsize=(9, 3), event_markers=_event_markers_for_trial()
+            _update_lfp_bokeh(
+                [{"y": trace1, "label": label1}, {"y": trace2, "label": label2}],
+                [spk1, spk2],
+                _event_times_for_trial(),
             )
 
             psd_pane.object = _psd_figure(_channel_psd_series(ch1_idx), figsize=(4, 3), title=label1)
@@ -489,11 +1294,26 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
                 _channel_coherence_series(ch1_idx, ch2_idx), label1, label2, figsize=(4, 3)
             )
 
-            main.objects = [
-                info_pane,
-                lfp_pane,
-                pn.Row(psd_pane, psd_pane_2, coherence_pane, sizing_mode="stretch_width"),
-            ]
+            hilbert_panes = _update_hilbert_panes([lfp1, lfp2])
+            if _update_quantile_pane(ch1_idx, ch2_idx):
+                hilbert_panes = hilbert_panes + [quantile_pane]
+
+            extras = []
+            if _update_sta_pane():
+                extras.append(sta_pane)
+            if _update_pac_pane():
+                extras.append(pac_pane)
+            if _update_spike_phase_pane():
+                extras.append(spike_phase_pane)
+            if _update_phase_diff_pane(ch1_idx, ch2_idx):
+                extras.append(phase_diff_pane)
+
+            main.objects = (
+                [info_pane, lfp_pane]
+                + hilbert_panes
+                + ([pn.Row(*extras, sizing_mode="stretch_width")] if extras else [])
+                + [pn.Row(psd_pane, psd_pane_2, coherence_pane, sizing_mode="stretch_width")]
+            )
 
         row = metadata.trial_info.iloc[trial_index]
         ttype = TrialType(int(row["trial_type"])).name
@@ -520,20 +1340,51 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
         include_flagged_channels,
         unique_recordings_only,
         pn.layout.Divider(),
+        "## Trial subset (pooled analyses)",
+        "Restricts which trials feed PSD, coherence, STA, PAC, spike-phase, "
+        "and quantile/phase-difference. The trace above always shows the "
+        "selected trial regardless.",
+        trial_type_filter,
+        behavioral_response_filter,
+        stimulus_filter,
+        clear_trial_subset_button,
+        subset_info_pane,
+        pn.layout.Divider(),
+        "## Zoom (LFP trace)",
+        zoom_start,
+        zoom_end,
+        reset_zoom_button,
+        pn.layout.Divider(),
         "## Overlays",
         show_spikes,
         show_events,
         filter_enabled,
+        hilbert_mode,
         band_select,
         custom_low,
         custom_high,
+        pn.layout.Divider(),
+        "## Additional analyses",
+        show_sta,
+        show_pac,
+        pac_phase_low,
+        pac_phase_high,
+        pac_amp_low,
+        pac_amp_high,
+        show_spike_phase,
+        show_quantile_regions,
+        phase_diff_bins,
     )
     main = pn.Column(info_pane, lfp_pane, psd_pane)
 
     monkey_select.param.watch(lambda e: (_update_dates(), _update_band_options()), "value")
     date_select.param.watch(_update_sessions, "value")
     clear_channels_button.on_click(_clear_channel_selection)
+    clear_trial_subset_button.on_click(_clear_trial_subset)
     channel_select.param.watch(_limit_channel_selection, "value")
+    reset_zoom_button.on_click(_reset_zoom)
+    for widget in (zoom_start, zoom_end):
+        widget.param.watch(_apply_zoom, "value")
     for widget in (
         monkey_select,
         date_select,
@@ -549,9 +1400,22 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
         show_spikes,
         show_events,
         filter_enabled,
+        hilbert_mode,
         band_select,
         custom_low,
         custom_high,
+        show_sta,
+        show_pac,
+        pac_phase_low,
+        pac_phase_high,
+        pac_amp_low,
+        pac_amp_high,
+        show_spike_phase,
+        show_quantile_regions,
+        phase_diff_bins,
+        trial_type_filter,
+        behavioral_response_filter,
+        stimulus_filter,
     ):
         widget.param.watch(_update_plot, "value")
 

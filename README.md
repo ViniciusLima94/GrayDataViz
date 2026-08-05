@@ -5,9 +5,12 @@ replacing the loading code duplicated across `GrayData-Analysis` (`GDa/`) and
 `phase_coupling_analysis` (`src/`).
 
 Phase 1 is a standalone, tested loading API. Phase 2 is a Panel-based GUI for
-browsing raw LFP recordings, comparing two channels, and inspecting their
-power spectra and coherence — all computed with the same multitaper
-parameters (`bandwidth`, `fmin`, `fmax`) as `phase_coupling_analysis`.
+browsing raw LFP recordings (in µV, mouse-zoomable), comparing two channels,
+and inspecting their power spectra, coherence, Hilbert envelope/phase,
+spike-triggered average, phase-amplitude coupling, spike-phase locking, and
+power-product quantile/phase-difference regions — all computed with the same
+multitaper/Hilbert parameters as `phase_coupling_analysis` where an
+equivalent exists there.
 
 ## GUI
 
@@ -39,13 +42,93 @@ the session.*
   `match_off`/offset field exists in `trial_info`).
 - **Apply bandpass filter**: pick a per-monkey band preset (from
   `phase_coupling_analysis/config.py`'s `bands`) or a custom range. When
-  enabled, the filtered signal **replaces** the raw one everywhere (trace,
-  power spectra, coherence) rather than overlaying both.
-- **Power spectra and coherence use every trial** in the session for the
-  selected channel(s) — not just the one currently selected for the raw
-  trace — matching how `xr_psd_array_multitaper`/`conn_spec_average` are
-  actually used in the pipeline. Results are cached per channel/filter
-  selection so switching trials or toggling spikes stays fast.
+  enabled, the filtered signal **replaces** the raw one everywhere it's used
+  as a per-trial trace (LFP trace, power spectra, coherence, spike-triggered
+  average) rather than overlaying both.
+- **Hilbert decomposition**: envelope and/or instantaneous phase (band-filter
+  then `scipy.signal.hilbert`, matching `phase_coupling_analysis`'s
+  `hilbert_decomposition`), using the band controls above, shown as its own
+  panel(s) below the LFP trace.
+- **Additional analyses** (each usable with one or two channels selected,
+  pooled across every trial in the session):
+  - **Spike-triggered average (µV)** — mean LFP waveform in a ±0.25s window
+    around each spike, computed on the filtered signal instead of raw when
+    the bandpass filter above is enabled (same "filtered replaces raw" rule).
+    Unlike the quantile/phase-difference panels below, this pools the *full*
+    trial window (no -0.5s-to-match-onset trim) — there's no evidence the
+    reference pipeline restricts STA that way, that trim is specific to
+    `save_burst_trains.py`'s burst-detection logic.
+  - **Phase-amplitude coupling (Tort MI)** — the standard Tort et al. (2010)
+    modulation index between an independently configurable phase band and
+    amplitude band, shown as a phase-binned mean-amplitude histogram.
+  - **Spike-phase locking** — phase (in the band configured above) at every
+    spike, as a histogram plus the mean resultant length (vector strength).
+  - **Power-product quantile regions** (two channels only) — each channel's
+    Hilbert envelope power (in the band configured above) is multiplied
+    together, percentile-ranked across every trial in the session, and split
+    into quartiles (Q1-Q4), reproducing the burst-detection method from
+    `phase_coupling_analysis/save_burst_trains.py`: only samples from -0.5s
+    through each trial's own match onset count toward the thresholds (the
+    padding beyond that, present in every other panel here, is excluded —
+    matching `trials_length_mask` there, not just the exploratory
+    `Phase_Analysis-Method_Sumary` notebook). A linked panel below the LFP
+    trace plots the selected trial's percentile trace plus which quartile it
+    falls in at each timepoint, evaluated against those thresholds even for
+    trials/times outside that window.
+  - **Phase-difference circular plot** (two channels only) — pick one or more
+    of those same quartiles and see the two channels' instantaneous phase
+    difference, pooled across every trial (same -0.5s-to-match-onset window
+    as above) and restricted to samples in that power-product quartile, as
+    an area-true circular histogram (bin *area*, not radius, encodes
+    frequency — see `plot_.py`'s `circular_hist`) with the circular mean and
+    standard deviation in its title. The two channels are always ordered
+    alphabetically by `{roi}_{channel}` before subtracting phases (`phase(A)
+    - phase(B)`, stated above the plot) to match
+    `phase_coupling_analysis/src/metrics/phase.py`'s pairing convention —
+    picking the same two channels in the opposite order in the selector
+    doesn't change anything, since std is sign-symmetric but the mean/the
+    histogram's orientation would otherwise flip depending on click order.
+
+![Power-product quantile regions and phase-difference circular plot for lucy/141017, trial 99, channels F1 (ch 63) vs V1 (ch 212)](docs/screenshots/lucy_141017_quantile_phasediff.png)
+- **Power spectra, coherence, and the additional analyses all use every
+  trial** in the session for the selected channel(s) — not just the one
+  currently selected for the raw trace — matching how
+  `xr_psd_array_multitaper`/`conn_spec_average` are actually used in the
+  pipeline. Results are cached per channel/filter/band selection so switching
+  trials or toggling spikes stays fast.
+- **Trial subset for those pooled analyses**: three filters (**trial type**,
+  **behavioral response**, **stimulus label**) restrict which trials feed
+  PSD, coherence, STA, PAC, spike-phase locking, and the quantile/
+  phase-difference panels — an empty selection means no filtering (all
+  trials, the default), and a **Clear selection** button resets all three at
+  once. A note under the filters reports how many trials currently match
+  (e.g. "332/595 trials"); if a combination matches none, it falls back to
+  all trials and says so. The power-product quartile thresholds for the
+  currently selected trial are still evaluated even if that trial itself
+  doesn't match the filter, so you can browse any trial against thresholds
+  defined by, say, only the correct-response trials. The raw LFP trace for
+  the trial picked above is unaffected by this filter — it always shows
+  whichever trial is selected.
+- **Split by stimulus**: selecting **two or more** stimulus labels switches
+  PSD, coherence, STA, and the phase-difference circular plot from pooling
+  those stimuli together to overlaying one curve per stimulus (color-coded,
+  a fixed palette slot per stimulus). STA additionally uses linestyle (solid
+  / dashed) to keep the two channels distinguishable now that color encodes
+  stimulus instead. The phase-difference plot adds one polar subplot per
+  (stimulus, quantile bin) combination, all side by side in the same row.
+  Quartile thresholds themselves are still computed from the combined
+  trial-subset filter (so "Q4" means the same power-product regime across
+  stimuli, only the phase-difference samples within it are split). PAC,
+  spike-phase locking, and the quantile-region time trace are unaffected —
+  they keep pooling every matching trial together regardless of how many
+  stimuli are selected.
+- **Zoom**: the LFP trace, Hilbert envelope, Hilbert phase, and power-product
+  quantile panels are all interactive Bokeh charts (pan, box-zoom,
+  mouse-wheel zoom) sharing one x-range — zooming any one of them zooms all
+  of them together, and the zoom persists across trial/channel changes
+  within a session. Unlike every other plot here (plain PNGs), these expose
+  their currently-displayed samples via the browser's dev tools. You can
+  also type an exact **zoom start/end (s)** or hit **Reset zoom**.
 
 Run it with:
 
@@ -116,10 +199,16 @@ intended:
    depended on long-term. For that, a real (paid) VM or PaaS host with a
    fixed domain would be the next step.
 
-Only static images ever reach the browser — every plot is rendered
-server-side to a PNG (`pn.pane.Matplotlib`, not a Bokeh-native chart), so
-there's no numeric data embedded in the page for someone to extract via
-dev tools, and the app has no export/download endpoint.
+Every plot except the LFP trace, Hilbert envelope, Hilbert phase, and
+power-product quantile panels is a server-rendered PNG (`pn.pane.Matplotlib`,
+not a Bokeh-native chart, including the phase-difference circular plot), so
+there's no numeric data embedded in the page for those to extract via dev
+tools. Those four are the deliberate exception — they're interactive Bokeh
+charts (linked zoom, see above), which means the *currently displayed*
+trial/channel's samples are inspectable via the browser's dev tools (not the
+rest of the dataset, and not through any export/download endpoint — the app
+doesn't have one). Worth knowing if "not downloadable" needs to be airtight
+rather than just "no bulk access."
 
 ## Loading API
 
@@ -134,9 +223,13 @@ dev tools, and the app has no export/download endpoint.
   data variables sharing a single `attrs` dict, instead of two `DataArray`s
   with the metadata dict duplicated between them.
 - **Per-monkey/alignment trial windows** (`windows.py`) resolved automatically
-  from `(monkey, align_to)`, matching `phase_coupling_analysis/config.py`'s
-  `return_evt_dt` — using one monkey's window on another's data can slice past
-  the end of its shorter recordings.
+  from `(monkey, align_to)`. For `cue` alignment this matches
+  `phase_coupling_analysis/util.py`'s `return_evt_dt` (the one every pipeline
+  script there actually loads data through, via `load_session_data`) —
+  `config.py` has a same-named function too, but nothing imports it. `match`
+  alignment isn't exercised anywhere in that pipeline, so there's no
+  reference value to port for it. Using one monkey's window on another's data
+  can slice past the end of its shorter recordings.
 - **Typed trial vocabulary** (`TrialType`, `BehavioralResponse` enums) instead
   of bare integer codes.
 - **Descriptive errors**: missing raw/derived files raise
