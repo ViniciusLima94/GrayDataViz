@@ -24,6 +24,8 @@ or, after `pip install -e ".[gui]"`:
 
 from __future__ import annotations
 
+import colorsys
+
 import matplotlib
 
 matplotlib.use("Agg")
@@ -31,7 +33,7 @@ from matplotlib.figure import Figure
 import numpy as np
 import pandas as pd
 import panel as pn
-from bokeh.models import ColumnDataSource, Span
+from bokeh.models import ColumnDataSource, FixedTicker, Span
 from bokeh.plotting import figure as bokeh_figure
 from mne.time_frequency import psd_array_multitaper
 from scipy import stats as scipy_stats
@@ -94,6 +96,37 @@ _STIMULUS_COLORS = [
     "#2a78d6", "#eb6834", "#1baf7a", "#eda100",
     "#e87ba4", "#008300", "#4a3aa7", "#e34948",
 ]
+
+# All-channels montage tab: slot 8 (red) for the two eye traces, so they
+# read as a different signal type than the LFP channels below them (which
+# get one distinct hue each -- see _distinct_colors).
+_COLOR_EYE = "#e34948"
+_MONTAGE_DEFAULT_HEIGHT = 1000  # px -- initial value of the height slider
+_MONTAGE_DEFAULT_SPACING = 12  # initial value of the spacing slider (see _update_montage)
+# Row baselines always sit exactly 1.0 apart, regardless of the spacing
+# slider -- trace amplitude (in the same data units) is what the slider
+# actually controls, as 1 / spacing. Keeping amplitude *relative to* a fixed
+# baseline unit (rather than both in absolute, height-dependent units) is
+# what makes the spacing slider's effect independent of the height slider:
+# with both expressed in absolute data-units instead, a small height + large
+# spacing combination could shrink every trace to sub-pixel amplitude
+# (technically still "correct" data, but visually indistinguishable from
+# empty) -- discovered by testing that exact combination and confirming
+# server- and browser-side data were fine even though the render looked
+# blank.
+_MONTAGE_ROW_UNIT = 1.0
+
+
+def _distinct_colors(n: int) -> list[str]:
+    """`n` hues spread evenly around the color wheel (fixed saturation/
+    lightness) as hex colors -- the all-channels montage needs one
+    distinguishable color per channel, and the channel count isn't known
+    ahead of time (varies by monkey/session/filter toggles), so a fixed
+    8-slot categorical palette would start repeating past 8 channels."""
+    return [
+        "#{:02x}{:02x}{:02x}".format(*(round(c * 255) for c in colorsys.hls_to_rgb(i / n, 0.5, 0.55)))
+        for i in range(n)
+    ]
 
 
 def _psd_all_trials(x: np.ndarray, fsample: float) -> tuple[np.ndarray, np.ndarray]:
@@ -242,6 +275,14 @@ def _spike_phase_locking(
     return bin_centers, density, resultant
 
 
+def _zscore(x: np.ndarray) -> np.ndarray:
+    """`(x - mean) / std`, NaN-aware (the eye traces can have a NaN tail --
+    see `load_session`'s `load_eye` docstring) and NaN-propagating (Bokeh
+    skips NaN samples when drawing a line, i.e. it renders as a gap)."""
+    std = np.nanstd(x)
+    return (x - np.nanmean(x)) / std if std > 0 else np.zeros_like(x)
+
+
 def _rank_percentile(x: np.ndarray) -> np.ndarray:
     """Percentile rank (0-1) of every value in `x`, pooled across the whole
     array (not row-wise) -- `scipy.stats.rankdata` handles ties."""
@@ -303,6 +344,7 @@ def _cached_session(
         exclude_slvr_msmod=exclude_slvr_msmod,
         only_unique_recordings=only_unique_recordings,
         load_spike_times=True,
+        load_eye=True,
         config=config,
     )
 
@@ -317,6 +359,17 @@ def _trial_label(trial_info: pd.DataFrame, trial_index: int) -> str:
     return f"Trial {trial_index} — {ttype}, {resp_label}"
 
 
+def _legend_above(ax, n_entries: int, fontsize: int = 8) -> None:
+    """Legend as a horizontal strip above the axes (never inside the plot
+    area, where it covers data) -- combine with `pad=` on `ax.set_title` (if
+    any) so the title sits above this strip rather than overlapping it."""
+    ax.legend(
+        loc="lower center", bbox_to_anchor=(0.5, 1.0), ncol=min(max(n_entries, 1), 4),
+        fontsize=fontsize, frameon=False, handlelength=1.5, columnspacing=1.2,
+        borderaxespad=0,
+    )
+
+
 def _psd_figure(
     series: list[tuple[np.ndarray, np.ndarray, str, str]],
     figsize: tuple[float, float],
@@ -329,8 +382,8 @@ def _psd_figure(
     ax.set_xlabel("Frequency (Hz)")
     ax.set_ylabel("Power spectral density (µV²/Hz)")
     if title:
-        ax.set_title(title, fontsize=9)
-    ax.legend(loc="upper right", fontsize=8)
+        ax.set_title(title, fontsize=9, pad=26)
+    _legend_above(ax, len(series))
     return fig
 
 
@@ -376,13 +429,15 @@ def _coherence_figure(
         ax.plot(freqs, coh, color=color, lw=1.5, label=label)
     ax.set_xlabel("Frequency (Hz)")
     ax.set_ylabel("Coherence")
-    ax.set_title(f"Coherence: {label1} vs {label2}", fontsize=9)
-    ax.legend(loc="upper right", fontsize=8)
+    ax.set_title(f"Coherence: {label1} vs {label2}", fontsize=9, pad=26)
+    _legend_above(ax, len(series))
     return fig
 
 
 def _sta_figure(
-    series: list[tuple[np.ndarray, np.ndarray, str, str, str]], figsize: tuple[float, float]
+    series: list[tuple[np.ndarray, np.ndarray, str, str, str]],
+    figsize: tuple[float, float],
+    title: str = "Spike-triggered average",
 ) -> Figure:
     """`series`: (t_rel, sta_wave_uv, color, label, linestyle)."""
     fig = Figure(figsize=figsize)
@@ -392,8 +447,8 @@ def _sta_figure(
     ax.axvline(0, color="0.6", lw=0.8, linestyle="--")
     ax.set_xlabel("Time from spike (s)")
     ax.set_ylabel("LFP (µV)")
-    ax.set_title("Spike-triggered average", fontsize=9)
-    ax.legend(loc="upper right", fontsize=8)
+    ax.set_title(title, fontsize=9, pad=26)
+    _legend_above(ax, len(series))
     return fig
 
 
@@ -418,10 +473,10 @@ def _phase_bar_figure(
         )
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
-    ax.set_title(title, fontsize=9)
+    ax.set_title(title, fontsize=9, pad=26)
     ax.set_xticks([-np.pi, 0, np.pi])
     ax.set_xticklabels(["-π", "0", "π"])
-    ax.legend(loc="upper right", fontsize=7)
+    _legend_above(ax, len(results), fontsize=7)
     return fig
 
 
@@ -475,28 +530,52 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
         label="Unique recordings only", value=False
     )
 
+    # --- Raw data plot: everything that changes what the LFP trace (and its
+    # direct spectral view -- PSD/coherence) shows for the selected trial.
     zoom_start = pn.widgets.FloatInput(label="Zoom start (s)", value=0.0)
     zoom_end = pn.widgets.FloatInput(label="Zoom end (s)", value=0.0)
     reset_zoom_button = pn.widgets.Button(label="Reset zoom")
-
     show_spikes = pn.widgets.Checkbox(label="Overlay spikes", value=False)
     show_events = pn.widgets.Checkbox(label="Show cue onset/offset & match onset", value=False)
-    filter_enabled = pn.widgets.Checkbox(label="Apply bandpass filter", value=False)
-    hilbert_mode = pn.widgets.Select(
-        label="Hilbert decomposition (uses the band below)",
-        options=["None", "Envelope", "Phase", "Envelope + Phase"],
-        value="None",
+    filter_enabled = pn.widgets.Checkbox(
+        label="Apply bandpass filter (trace, PSD & coherence)", value=False
     )
-    band_select = pn.widgets.Select(label="Band preset", options=["custom"])
-    custom_low = pn.widgets.FloatInput(label="Low (Hz)", value=8.0, start=0.0)
-    custom_high = pn.widgets.FloatInput(label="High (Hz)", value=12.0, start=0.1)
+    raw_band_select = pn.widgets.Select(label="Band preset", options=["custom"])
+    raw_custom_low = pn.widgets.FloatInput(label="Low (Hz)", value=8.0, start=0.0)
+    raw_custom_high = pn.widgets.FloatInput(label="High (Hz)", value=12.0, start=0.1)
 
+    # --- Spike-triggered average: its own filter/band, independent of the
+    # raw trace's -- so the STA waveform doesn't silently change just because
+    # the raw trace's display filter was toggled for an unrelated reason.
     show_sta = pn.widgets.Checkbox(label="Spike-triggered average (µV)", value=False)
+    show_cross_sta = pn.widgets.Checkbox(
+        label="Include cross-channel STA (2 channels: A on B's spikes, B on A's spikes)",
+        value=False,
+    )
+    sta_filter_enabled = pn.widgets.Checkbox(label="Apply bandpass filter to STA", value=False)
+    sta_band_select = pn.widgets.Select(label="Band preset", options=["custom"])
+    sta_custom_low = pn.widgets.FloatInput(label="Low (Hz)", value=8.0, start=0.0)
+    sta_custom_high = pn.widgets.FloatInput(label="High (Hz)", value=12.0, start=0.1)
+
+    # --- Phase-amplitude coupling: fully self-contained (its own phase/amp
+    # bands), nothing else here to decouple.
     show_pac = pn.widgets.Checkbox(label="Phase-amplitude coupling (Tort MI)", value=False)
     pac_phase_low = pn.widgets.FloatInput(label="PAC phase band low (Hz)", value=4.0, start=0.0)
     pac_phase_high = pn.widgets.FloatInput(label="PAC phase band high (Hz)", value=8.0, start=0.1)
     pac_amp_low = pn.widgets.FloatInput(label="PAC amplitude band low (Hz)", value=30.0, start=0.0)
     pac_amp_high = pn.widgets.FloatInput(label="PAC amplitude band high (Hz)", value=80.0, start=0.1)
+
+    # --- Phase coupling: Hilbert decomposition, spike-phase locking, the
+    # power-product quantile regions, and the phase-difference circular plot
+    # all derive from the same analytic signal, so they share one band here.
+    hilbert_mode = pn.widgets.Select(
+        label="Hilbert decomposition (uses the band below)",
+        options=["None", "Envelope", "Phase", "Envelope + Phase"],
+        value="None",
+    )
+    phase_band_select = pn.widgets.Select(label="Band preset", options=["custom"])
+    phase_custom_low = pn.widgets.FloatInput(label="Low (Hz)", value=8.0, start=0.0)
+    phase_custom_high = pn.widgets.FloatInput(label="High (Hz)", value=12.0, start=0.1)
     show_spike_phase = pn.widgets.Checkbox(
         label="Spike-phase locking (uses the band above)", value=False
     )
@@ -613,7 +692,54 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
     quantile_bokeh.legend.label_text_font_size = "8pt"
     quantile_pane = pn.pane.Bokeh(quantile_bokeh)
 
+    # All-channels montage (second tab): every currently-loaded LFP channel
+    # plus both eye traces, z-scored and stacked with a fixed vertical offset
+    # per trace -- one shared x-range with the main LFP chart, so zooming
+    # either one zooms both.
+    montage_bokeh = bokeh_figure(
+        height=1000,
+        sizing_mode="stretch_width",
+        x_range=lfp_bokeh.x_range,
+        tools="pan,box_zoom,wheel_zoom,reset,save",
+        active_drag="box_zoom",
+        active_scroll="wheel_zoom",
+        x_axis_label="Time (s)",
+    )
+    montage_bokeh.toolbar.logo = None
+    montage_bokeh.yaxis.axis_label = None
+    montage_source = ColumnDataSource(data=dict(xs=[], ys=[], color=[]))
+    montage_bokeh.multi_line("xs", "ys", source=montage_source, line_color="color", line_width=1)
+    montage_event_spans = {
+        "cue_on": Span(location=0, dimension="height", line_color="gray", line_dash="solid", line_width=1),
+        "cue_off": Span(location=0, dimension="height", line_color="gray", line_dash="dashed", line_width=1),
+        "match_on": Span(location=0, dimension="height", line_color="gray", line_dash="dotted", line_width=1),
+    }
+    for span in montage_event_spans.values():
+        span.visible = False
+        montage_bokeh.add_layout(span)
+    montage_pane = pn.pane.Bokeh(montage_bokeh)
+    montage_caption = pn.pane.Markdown(
+        "*Selected channels below (independent of the channel(s) picked for "
+        "the trace/spectral view; defaults to every currently-loaded channel, "
+        "respecting the flagged-channel/unique-recordings filters above), "
+        "z-scored and stacked, for the selected trial. Eye position "
+        "(horizontal/vertical) is shown in red at the top. Task markers "
+        "match \"Show cue onset/offset & match onset\" above.*",
+        styles={"font-size": "0.85em", "color": "#666"},
+    )
+    montage_channel_select = pn.widgets.MultiSelect(
+        label="Channels to display", options={}, size=8
+    )
+    montage_clear_channels_button = pn.widgets.Button(label="Clear selection")
+    montage_height_slider = pn.widgets.IntSlider(
+        label="Plot height (px)", start=300, end=3000, step=50, value=_MONTAGE_DEFAULT_HEIGHT
+    )
+    montage_spacing_slider = pn.widgets.IntSlider(
+        label="Trace spacing", start=2, end=40, step=1, value=_MONTAGE_DEFAULT_SPACING
+    )
+
     sta_pane = pn.pane.Matplotlib(Figure(figsize=(4, 3)), tight=True, sizing_mode="stretch_width")
+    cross_sta_pane = pn.pane.Matplotlib(Figure(figsize=(4, 3)), tight=True, sizing_mode="stretch_width")
     pac_pane = pn.pane.Matplotlib(Figure(figsize=(4, 3)), tight=True, sizing_mode="stretch_width")
     spike_phase_pane = pn.pane.Matplotlib(Figure(figsize=(4, 3)), tight=True, sizing_mode="stretch_width")
     phase_diff_pane = pn.pane.Matplotlib(Figure(figsize=(4, 3)), tight=True, sizing_mode="stretch_width")
@@ -637,13 +763,16 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
     def _update_band_options(_event=None):
         bands = band_presets(monkey_select.value) if monkey_select.value else []
         labels = [f"{lo:g}-{hi:g} Hz" for lo, hi in bands] + ["custom"]
-        band_select.options = labels
-        band_select.value = labels[0]
+        for select in (raw_band_select, sta_band_select, phase_band_select):
+            select.options = labels
+            select.value = labels[0]
 
-    def _resolve_band() -> tuple[float, float]:
-        if band_select.value == "custom":
-            return custom_low.value, custom_high.value
-        low_str, high_str = band_select.value.replace(" Hz", "").split("-")
+    def _resolve_band(
+        select: pn.widgets.Select, low: pn.widgets.FloatInput, high: pn.widgets.FloatInput
+    ) -> tuple[float, float]:
+        if select.value == "custom":
+            return low.value, high.value
+        low_str, high_str = select.value.replace(" Hz", "").split("-")
         return float(low_str), float(high_str)
 
     def _limit_channel_selection(event):
@@ -652,6 +781,9 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
 
     def _clear_channel_selection(_event=None):
         channel_select.value = []
+
+    def _clear_montage_channel_selection(_event=None):
+        montage_channel_select.value = []
 
     def _clear_trial_subset(_event=None):
         trial_type_filter.value = []
@@ -706,6 +838,8 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
         }
         channel_select.options = channel_options
         channel_select.value = [next(iter(channel_options.values()))]
+        montage_channel_select.options = channel_options
+        montage_channel_select.value = list(channel_options.values())
 
         stim_values = sorted(
             int(v) for v in pd.unique(metadata.trial_info["sample_image"]) if pd.notna(v)
@@ -715,7 +849,85 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
 
         state["full_range"] = (float(ds.time.values[0]), float(ds.time.values[-1]))
         _update_plot()
+        _update_montage()
         _reset_zoom()
+
+    def _event_times_for_trial(ds, trial_index, fsample):
+        # Shared by the main LFP chart and the all-channels montage.
+        if not show_events.value:
+            return {}
+        pos = int(np.where(ds.trials.values == trial_index)[0][0])
+        align_to = ds.attrs["align_to"]
+        t0 = (ds.attrs["t_cue_on"] if align_to == "cue" else ds.attrs["t_match_on"])[pos]
+        return {
+            "cue_on": (ds.attrs["t_cue_on"][pos] - t0) / fsample,
+            "cue_off": (ds.attrs["t_cue_off"][pos] - t0) / fsample,
+            "match_on": (ds.attrs["t_match_on"][pos] - t0) / fsample,
+        }
+
+    def _update_montage(_event=None):
+        # All-channels montage tab: intentionally watches only trial_select/
+        # show_events (plus session reload) -- not every other-analysis
+        # toggle -- so it doesn't get recomputed every time an unrelated
+        # checkbox flips.
+        ds = state["ds"]
+        if ds is None or trial_select.value is None:
+            return
+        trial_index = trial_select.value
+        time = ds.time.values
+        fsample = float(ds.attrs["fsample"])
+        selected_channels = sorted(montage_channel_select.value)
+        n_channels = len(selected_channels)
+        has_eye = "eye" in ds
+
+        # amplitude_scale is data-units per z-score std, relative to the
+        # fixed 1.0 row unit -- see _MONTAGE_ROW_UNIT's comment for why this
+        # (rather than an absolute spacing value) is what the slider drives.
+        amplitude_scale = _MONTAGE_ROW_UNIT / float(montage_spacing_slider.value)
+        n_eye_rows = 2 if has_eye else 0
+        total_rows = n_channels + n_eye_rows + (1 if has_eye else 0)  # +1 gap row
+        pos = total_rows
+
+        xs, ys, colors, ticks, labels = [], [], [], [], []
+        channel_colors = _distinct_colors(n_channels)
+
+        for color_i, i in enumerate(selected_channels):
+            raw = ds.lfp.sel(trials=trial_index).isel(roi=i).values * _VOLTS_TO_MICROVOLTS
+            y = _zscore(raw) * amplitude_scale + pos * _MONTAGE_ROW_UNIT
+            xs.append(time)
+            ys.append(y)
+            colors.append(channel_colors[color_i])
+            ticks.append(pos * _MONTAGE_ROW_UNIT)
+            labels.append(f"{ds.roi.values[i]} (ch {ds.attrs['channels_labels'][i]})")
+            pos -= 1
+
+        if has_eye:
+            pos -= 1  # gap row between LFP channels and eye traces
+            eye_trial = ds.eye.sel(trials=trial_index).values  # (eye_axis, time)
+            for axis_i, axis_label in enumerate(("Eye H", "Eye V")):
+                y = _zscore(eye_trial[axis_i]) * amplitude_scale + pos * _MONTAGE_ROW_UNIT
+                xs.append(time)
+                ys.append(y)
+                colors.append(_COLOR_EYE)
+                ticks.append(pos * _MONTAGE_ROW_UNIT)
+                labels.append(axis_label)
+                pos -= 1
+
+        montage_source.data = dict(xs=xs, ys=ys, color=colors)
+        montage_bokeh.yaxis.ticker = FixedTicker(ticks=ticks)
+        montage_bokeh.yaxis.major_label_overrides = {t: lbl for t, lbl in zip(ticks, labels)}
+        montage_bokeh.y_range.start = -_MONTAGE_ROW_UNIT
+        montage_bokeh.y_range.end = (total_rows + 1) * _MONTAGE_ROW_UNIT
+        montage_bokeh.height = montage_height_slider.value
+
+        event_times = _event_times_for_trial(ds, trial_index, fsample)
+        for key, sp in montage_event_spans.items():
+            t = event_times.get(key)
+            if t is not None:
+                sp.location = t
+                sp.visible = True
+            else:
+                sp.visible = False
 
     def _update_plot(_event=None):
         ds = state["ds"]
@@ -732,18 +944,31 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
         if len(selected) > 1:
             channel_colors[selected[1]] = _COLOR_FILTERED
 
-        needs_band = (
-            filter_enabled.value
-            or hilbert_mode.value != "None"
+        raw_low = raw_high = None
+        raw_band_label = None
+        if filter_enabled.value:
+            raw_low, raw_high = _resolve_band(raw_band_select, raw_custom_low, raw_custom_high)
+            raw_band_label = f"{raw_low:g}-{raw_high:g} Hz"
+
+        sta_low = sta_high = None
+        sta_band_label = None
+        if sta_filter_enabled.value:
+            sta_low, sta_high = _resolve_band(sta_band_select, sta_custom_low, sta_custom_high)
+            sta_band_label = f"{sta_low:g}-{sta_high:g} Hz"
+
+        needs_phase_band = (
+            hilbert_mode.value != "None"
             or show_spike_phase.value
             or show_quantile_regions.value
             or bool(phase_diff_bins.value)
         )
-        band_label = None
-        low = high = None
-        if needs_band:
-            low, high = _resolve_band()
-            band_label = f"{low:g}-{high:g} Hz"
+        phase_low = phase_high = None
+        phase_band_label = None
+        if needs_phase_band:
+            phase_low, phase_high = _resolve_band(
+                phase_band_select, phase_custom_low, phase_custom_high
+            )
+            phase_band_label = f"{phase_low:g}-{phase_high:g} Hz"
 
         hilbert_modes = []
         if hilbert_mode.value in ("Envelope", "Envelope + Phase"):
@@ -760,23 +985,11 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
         def _trial_position():
             return int(np.where(ds.trials.values == trial_index)[0][0])
 
-        def _event_times_for_trial():
-            if not show_events.value:
-                return {}
-            pos = _trial_position()
-            align_to = ds.attrs["align_to"]
-            t0 = (ds.attrs["t_cue_on"] if align_to == "cue" else ds.attrs["t_match_on"])[pos]
-            return {
-                "cue_on": (ds.attrs["t_cue_on"][pos] - t0) / fsample,
-                "cue_off": (ds.attrs["t_cue_off"][pos] - t0) / fsample,
-                "match_on": (ds.attrs["t_match_on"][pos] - t0) / fsample,
-            }
-
         def _all_trials_raw(ch_idx):
             return ds.lfp.isel(roi=ch_idx).values * _VOLTS_TO_MICROVOLTS  # (n_trials, n_times)
 
         def _all_trials_filtered(ch_idx):
-            return bandpass_filter(_all_trials_raw(ch_idx), fsample, low, high)
+            return bandpass_filter(_all_trials_raw(ch_idx), fsample, phase_low, phase_high)
 
         def _all_trials_spikes(ch_idx):
             return ds.spikes.isel(roi=ch_idx).values.astype(bool) if "spikes" in ds else None
@@ -867,7 +1080,7 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
         def _pooled_trials_raw_for(ch_idx, mask):
             return _all_trials_raw(ch_idx)[mask]
 
-        def _pooled_trials_filtered_for(ch_idx, mask):
+        def _pooled_trials_filtered_for(ch_idx, mask, low, high):
             return bandpass_filter(_pooled_trials_raw_for(ch_idx, mask), fsample, low, high)
 
         def _pooled_trials_spikes_for(ch_idx, mask):
@@ -876,9 +1089,6 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
 
         def _pooled_trials_raw(ch_idx):
             return _pooled_trials_raw_for(ch_idx, subset_mask)
-
-        def _pooled_trials_filtered(ch_idx):
-            return _pooled_trials_filtered_for(ch_idx, subset_mask)
 
         def _pooled_trials_spikes(ch_idx):
             return _pooled_trials_spikes_for(ch_idx, subset_mask)
@@ -890,7 +1100,7 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
             filtered = None
             if filter_enabled.value:
                 try:
-                    filtered = bandpass_filter(lfp, fsample, low, high)
+                    filtered = bandpass_filter(lfp, fsample, raw_low, raw_high)
                 except ValueError as exc:
                     info_pane.object = f"**Filter error:** {exc}"
             spikes = None
@@ -909,10 +1119,14 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
                 if filter_enabled.value:
                     try:
                         freqs, psd = _cached_spectral(
-                            ("psd", ch_idx, "filt", low, high, glabel, subset_signature),
-                            lambda m=gmask: _psd_all_trials(_pooled_trials_filtered_for(ch_idx, m), fsample),
+                            ("psd", ch_idx, "filt", raw_low, raw_high, glabel, subset_signature),
+                            lambda m=gmask: _psd_all_trials(
+                                _pooled_trials_filtered_for(ch_idx, m, raw_low, raw_high), fsample
+                            ),
                         )
-                        label = f"{glabel} filtered {band_label}" if glabel else f"filtered {band_label}"
+                        label = (
+                            f"{glabel} filtered {raw_band_label}" if glabel else f"filtered {raw_band_label}"
+                        )
                         series.append((freqs, psd, color or _COLOR_FILTERED, label))
                         added = True
                     except ValueError as exc:
@@ -933,14 +1147,16 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
                 if filter_enabled.value:
                     try:
                         freqs, coh = _cached_spectral(
-                            ("coh", ch1_idx, ch2_idx, "filt", low, high, glabel, subset_signature),
+                            ("coh", ch1_idx, ch2_idx, "filt", raw_low, raw_high, glabel, subset_signature),
                             lambda m=gmask: _coherence_all_trials(
-                                _pooled_trials_filtered_for(ch1_idx, m),
-                                _pooled_trials_filtered_for(ch2_idx, m),
+                                _pooled_trials_filtered_for(ch1_idx, m, raw_low, raw_high),
+                                _pooled_trials_filtered_for(ch2_idx, m, raw_low, raw_high),
                                 fsample,
                             ),
                         )
-                        label = f"{glabel} filtered {band_label}" if glabel else f"filtered {band_label}"
+                        label = (
+                            f"{glabel} filtered {raw_band_label}" if glabel else f"filtered {raw_band_label}"
+                        )
                         series.append((freqs, coh, color or _COLOR_FILTERED, label))
                         added = True
                     except ValueError as exc:
@@ -963,7 +1179,7 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
             if not hilbert_modes:
                 return []
             try:
-                analytics = [_hilbert_analytic(raw, fsample, low, high) for raw in channel_specs]
+                analytics = [_hilbert_analytic(raw, fsample, phase_low, phase_high) for raw in channel_specs]
             except ValueError as exc:
                 info_pane.object = f"**Hilbert error:** {exc}"
                 return []
@@ -988,31 +1204,50 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
                 panes.append(phase_pane)
             return panes
 
-        def _update_sta_pane() -> bool:
+        def _update_sta_pane() -> list:
             if not show_sta.value:
-                return False
-            series = []
-            for ch_idx in selected:
-                # Solid for the first selected channel, dashed for the second
-                # -- only matters when split_by_stimulus, where color is used
-                # for stimulus identity instead of channel identity.
-                linestyle = "-" if ch_idx == selected[0] else "--"
+                return []
+            # (lfp_ch, spike_ch) pairs: self-STA for every selected channel,
+            # plus (if enabled, and exactly 2 channels selected) the two
+            # cross-channel pairs -- channel A's LFP triggered on channel B's
+            # spikes and vice versa. Cross terms go in their own separate
+            # figure (cross_sta_pane): overlaid with the self-terms they were
+            # easy to miss (much smaller amplitude, sharing axes with the
+            # self-STA's own deflection).
+            pairs = [(ch_idx, ch_idx) for ch_idx in selected]
+            if show_cross_sta.value and len(selected) == 2:
+                ch_a, ch_b = selected
+                pairs += [(ch_a, ch_b), (ch_b, ch_a)]
+
+            def _linestyle(lfp_ch, spike_ch):
+                if lfp_ch == spike_ch:
+                    return "-" if (not split_by_stimulus or lfp_ch == selected[0]) else "--"
+                return ":" if lfp_ch == selected[0] else "-."
+
+            self_series, cross_series = [], []
+            for lfp_ch, spike_ch in pairs:
+                is_cross = lfp_ch != spike_ch
+                linestyle = _linestyle(lfp_ch, spike_ch)
                 for i, (glabel, gmask) in enumerate(stim_groups):
-                    spikes_all = _pooled_trials_spikes_for(ch_idx, gmask)
+                    spikes_all = _pooled_trials_spikes_for(spike_ch, gmask)
                     if spikes_all is None or spikes_all.size == 0:
                         continue
-                    # Filtered replaces raw here too, once a filter is applied.
-                    if filter_enabled.value:
+                    # Filtered replaces raw here too, once a filter is applied --
+                    # STA has its own filter toggle/band, independent of the raw
+                    # trace's (sta_filter_enabled, not filter_enabled).
+                    if sta_filter_enabled.value:
                         try:
-                            lfp_all = _pooled_trials_filtered_for(ch_idx, gmask)
+                            lfp_all = _pooled_trials_filtered_for(lfp_ch, gmask, sta_low, sta_high)
                         except ValueError as exc:
                             info_pane.object = f"**STA error:** {exc}"
                             continue
-                        cache_key = ("sta", ch_idx, "filt", low, high, glabel, subset_signature)
-                        suffix = f" filtered {band_label}"
+                        cache_key = (
+                            "sta", lfp_ch, spike_ch, "filt", sta_low, sta_high, glabel, subset_signature
+                        )
+                        suffix = f" filtered {sta_band_label}"
                     else:
-                        lfp_all = _pooled_trials_raw_for(ch_idx, gmask)
-                        cache_key = ("sta", ch_idx, "raw", glabel, subset_signature)
+                        lfp_all = _pooled_trials_raw_for(lfp_ch, gmask)
+                        cache_key = ("sta", lfp_ch, spike_ch, "raw", glabel, subset_signature)
                         suffix = ""
                     t_rel, sta = _cached_spectral(
                         cache_key,
@@ -1020,17 +1255,30 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
                     )
                     if sta is None:
                         continue
+                    label_core = (
+                        f"{index_to_label[lfp_ch]} on {index_to_label[spike_ch]} spikes"
+                        if is_cross
+                        else index_to_label[lfp_ch]
+                    )
                     if split_by_stimulus:
                         color = _STIMULUS_COLORS[i % len(_STIMULUS_COLORS)]
-                        label = f"{index_to_label[ch_idx]} — {glabel}{suffix}"
-                        series.append((t_rel, sta, color, label, linestyle))
+                        label = f"{label_core} — {glabel}{suffix}"
                     else:
-                        label = f"{index_to_label[ch_idx]}{suffix}"
-                        series.append((t_rel, sta, channel_colors[ch_idx], label, "-"))
-            if not series:
-                return False
-            sta_pane.object = _sta_figure(series, figsize=(4, 3))
-            return True
+                        color = channel_colors[lfp_ch]
+                        label = f"{label_core}{suffix}"
+                    entry = (t_rel, sta, color, label, linestyle)
+                    (cross_series if is_cross else self_series).append(entry)
+
+            panes = []
+            if self_series:
+                sta_pane.object = _sta_figure(self_series, figsize=(4, 3))
+                panes.append(sta_pane)
+            if cross_series:
+                cross_sta_pane.object = _sta_figure(
+                    cross_series, figsize=(4, 3), title="Cross-channel STA"
+                )
+                panes.append(cross_sta_pane)
+            return panes
 
         def _update_pac_pane() -> bool:
             if not show_pac.value:
@@ -1071,9 +1319,9 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
                     continue
                 try:
                     bin_centers, density, r = _cached_spectral(
-                        ("spike_phase", ch_idx, low, high, subset_signature),
+                        ("spike_phase", ch_idx, phase_low, phase_high, subset_signature),
                         lambda ch=ch_idx, s=spikes_all: _spike_phase_locking(
-                            _pooled_trials_raw(ch), s, fsample, (low, high)
+                            _pooled_trials_raw(ch), s, fsample, (phase_low, phase_high)
                         ),
                     )
                 except ValueError as exc:
@@ -1090,7 +1338,7 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
                 return False
             spike_phase_pane.object = _phase_bar_figure(
                 results, "Spike phase (rad)", "Spike probability",
-                f"Spike-phase locking ({band_label})", figsize=(4, 3),
+                f"Spike-phase locking ({phase_band_label})", figsize=(4, 3),
             )
             return True
 
@@ -1106,8 +1354,8 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
             # quartile thresholds): product and percentile are (n_trials,
             # n_times) over ALL trials, thresholds are 5 edge values.
             def _compute():
-                p1 = np.abs(_hilbert_analytic(_all_trials_raw(ch1_idx), fsample, low, high)) ** 2
-                p2 = np.abs(_hilbert_analytic(_all_trials_raw(ch2_idx), fsample, low, high)) ** 2
+                p1 = np.abs(_hilbert_analytic(_all_trials_raw(ch1_idx), fsample, phase_low, phase_high)) ** 2
+                p2 = np.abs(_hilbert_analytic(_all_trials_raw(ch2_idx), fsample, phase_low, phase_high)) ** 2
                 product = p1 * p2
                 valid_subset = subset_mask[:, None] & _burst_window_mask()
                 thrs = _quantile_thresholds(product[valid_subset])
@@ -1118,15 +1366,17 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
                 ).reshape(product.shape)
                 return product, percentile, thrs
             return _cached_spectral(
-                ("quantile", ch1_idx, ch2_idx, low, high, subset_signature), _compute
+                ("quantile", ch1_idx, ch2_idx, phase_low, phase_high, subset_signature), _compute
             )
 
         def _phase_diff_all(ch1_idx, ch2_idx):
             def _compute():
-                a1 = _hilbert_analytic(_all_trials_raw(ch1_idx), fsample, low, high)
-                a2 = _hilbert_analytic(_all_trials_raw(ch2_idx), fsample, low, high)
+                a1 = _hilbert_analytic(_all_trials_raw(ch1_idx), fsample, phase_low, phase_high)
+                a2 = _hilbert_analytic(_all_trials_raw(ch2_idx), fsample, phase_low, phase_high)
                 return _phase_difference_all_trials(a1, a2)
-            return _cached_spectral(("phase_diff_all", ch1_idx, ch2_idx, low, high), _compute)
+            return _cached_spectral(
+                ("phase_diff_all", ch1_idx, ch2_idx, phase_low, phase_high), _compute
+            )
 
         def _update_quantile_pane(ch1_idx, ch2_idx) -> bool:
             if not show_quantile_regions.value:
@@ -1253,15 +1503,15 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
             # Filtered replaces raw (not layered on top of it) once a filter is applied.
             trace = filtered if filtered is not None else lfp
             _update_lfp_bokeh(
-                [{"y": trace, "label": "signal"}], [spikes], _event_times_for_trial()
+                [{"y": trace, "label": "signal"}], [spikes],
+                _event_times_for_trial(ds, trial_index, fsample),
             )
 
             psd_pane.object = _psd_figure(_channel_psd_series(ch_idx), figsize=(4, 3))
 
             hilbert_panes = _update_hilbert_panes([lfp])
             extras = []
-            if _update_sta_pane():
-                extras.append(sta_pane)
+            extras.extend(_update_sta_pane())
             if _update_pac_pane():
                 extras.append(pac_pane)
             if _update_spike_phase_pane():
@@ -1285,7 +1535,7 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
             _update_lfp_bokeh(
                 [{"y": trace1, "label": label1}, {"y": trace2, "label": label2}],
                 [spk1, spk2],
-                _event_times_for_trial(),
+                _event_times_for_trial(ds, trial_index, fsample),
             )
 
             psd_pane.object = _psd_figure(_channel_psd_series(ch1_idx), figsize=(4, 3), title=label1)
@@ -1299,8 +1549,7 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
                 hilbert_panes = hilbert_panes + [quantile_pane]
 
             extras = []
-            if _update_sta_pane():
-                extras.append(sta_pane)
+            extras.extend(_update_sta_pane())
             if _update_pac_pane():
                 extras.append(pac_pane)
             if _update_spike_phase_pane():
@@ -1333,51 +1582,73 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
         date_select,
         session_select,
         align_select,
-        "## Trial / channel",
+        pn.layout.Divider(),
+        "## Raw data plot",
+        "Trial/channel selection, zoom, and overlays for the LFP trace above "
+        "(and its direct spectral view -- PSD/coherence).",
         trial_select,
         channel_select,
         clear_channels_button,
         include_flagged_channels,
         unique_recordings_only,
+        zoom_start,
+        zoom_end,
+        reset_zoom_button,
+        show_spikes,
+        show_events,
+        filter_enabled,
+        raw_band_select,
+        raw_custom_low,
+        raw_custom_high,
         pn.layout.Divider(),
         "## Trial subset (pooled analyses)",
-        "Restricts which trials feed PSD, coherence, STA, PAC, spike-phase, "
-        "and quantile/phase-difference. The trace above always shows the "
-        "selected trial regardless.",
+        "Restricts which trials feed PSD, coherence, and the analyses below. "
+        "The trace above always shows the selected trial regardless.",
         trial_type_filter,
         behavioral_response_filter,
         stimulus_filter,
         clear_trial_subset_button,
         subset_info_pane,
         pn.layout.Divider(),
-        "## Zoom (LFP trace)",
-        zoom_start,
-        zoom_end,
-        reset_zoom_button,
-        pn.layout.Divider(),
-        "## Overlays",
-        show_spikes,
-        show_events,
-        filter_enabled,
-        hilbert_mode,
-        band_select,
-        custom_low,
-        custom_high,
-        pn.layout.Divider(),
-        "## Additional analyses",
+        "## Spike-triggered average",
         show_sta,
+        show_cross_sta,
+        sta_filter_enabled,
+        sta_band_select,
+        sta_custom_low,
+        sta_custom_high,
+        pn.layout.Divider(),
+        "## Phase-amplitude coupling (PAC)",
         show_pac,
         pac_phase_low,
         pac_phase_high,
         pac_amp_low,
         pac_amp_high,
+        pn.layout.Divider(),
+        "## Phase coupling",
+        hilbert_mode,
+        phase_band_select,
+        phase_custom_low,
+        phase_custom_high,
         show_spike_phase,
         show_quantile_regions,
         phase_diff_bins,
     )
     main = pn.Column(info_pane, lfp_pane, psd_pane)
+    montage_tab = pn.Column(
+        montage_caption,
+        pn.Row(montage_channel_select, montage_clear_channels_button),
+        montage_pane,
+        pn.Row(montage_height_slider, montage_spacing_slider, sizing_mode="stretch_width"),
+    )
 
     monkey_select.param.watch(lambda e: (_update_dates(), _update_band_options()), "value")
+    trial_select.param.watch(_update_montage, "value")
+    show_events.param.watch(_update_montage, "value")
+    montage_channel_select.param.watch(_update_montage, "value")
+    montage_clear_channels_button.on_click(_clear_montage_channel_selection)
+    montage_height_slider.param.watch(_update_montage, "value_throttled")
+    montage_spacing_slider.param.watch(_update_montage, "value_throttled")
     date_select.param.watch(_update_sessions, "value")
     clear_channels_button.on_click(_clear_channel_selection)
     clear_trial_subset_button.on_click(_clear_trial_subset)
@@ -1400,11 +1671,19 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
         show_spikes,
         show_events,
         filter_enabled,
+        raw_band_select,
+        raw_custom_low,
+        raw_custom_high,
         hilbert_mode,
-        band_select,
-        custom_low,
-        custom_high,
+        phase_band_select,
+        phase_custom_low,
+        phase_custom_high,
         show_sta,
+        show_cross_sta,
+        sta_filter_enabled,
+        sta_band_select,
+        sta_custom_low,
+        sta_custom_high,
         show_pac,
         pac_phase_low,
         pac_phase_high,
@@ -1424,8 +1703,9 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
     _update_sessions()
     _reload_session()
 
+    tabs = pn.Tabs(("Trace / spectral analysis", main), ("Multi-channel view", montage_tab))
     return pn.template.FastListTemplate(
-        title="GrayDataViz — LFP Explorer", sidebar=[sidebar], main=[main]
+        title="GrayDataViz — LFP Explorer", sidebar=[sidebar], main=[tabs]
     )
 
 

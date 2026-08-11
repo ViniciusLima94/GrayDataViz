@@ -50,14 +50,23 @@ the session.*
   `hilbert_decomposition`), using the band controls above, shown as its own
   panel(s) below the LFP trace.
 - **Additional analyses** (each usable with one or two channels selected,
-  pooled across every trial in the session):
+  pooled across every trial in the session). Every one of these (plus PSD
+  and coherence) puts its legend as a horizontal strip above the axes rather
+  than inside the plot, where it would otherwise sit on top of the data:
   - **Spike-triggered average (µV)** — mean LFP waveform in a ±0.25s window
     around each spike, computed on the filtered signal instead of raw when
     the bandpass filter above is enabled (same "filtered replaces raw" rule).
     Unlike the quantile/phase-difference panels below, this pools the *full*
     trial window (no -0.5s-to-match-onset trim) — there's no evidence the
     reference pipeline restricts STA that way, that trim is specific to
-    `save_burst_trains.py`'s burst-detection logic.
+    `save_burst_trains.py`'s burst-detection logic. **Include cross-channel
+    STA** (two channels only) adds channel A's LFP triggered on channel B's
+    spikes and vice versa, in their own separate plot next to the self-STA
+    one (overlaid with the self-terms, the much smaller cross-channel
+    deflection was easy to miss) — color still tracks channel/stimulus
+    identity as elsewhere, and linestyle marks which of the four
+    combinations a line is (solid/dashed for the two self-terms, dotted/
+    dash-dot for the two cross-terms).
   - **Phase-amplitude coupling (Tort MI)** — the standard Tort et al. (2010)
     modulation index between an independently configurable phase band and
     amplitude band, shown as a phase-binned mean-amplitude histogram.

@@ -42,10 +42,12 @@ def load_session(
     exclude_slvr_msmod: bool = True,
     only_unique_recordings: bool = False,
     load_spike_times: bool = False,
+    load_eye: bool = False,
     config: DataConfig | None = None,
     show_progress: bool = False,
 ) -> xr.Dataset:
-    """Load raw LFP (and optionally binary spike-time rasters) for one session.
+    """Load raw LFP (and optionally binary spike-time rasters, and/or eye
+    position) for one session.
 
     Parameters
     ----------
@@ -67,6 +69,14 @@ def load_session(
         Restrict to channels marked non-redundant in `<monkey>/unique_recordings.nc`.
     load_spike_times:
         Also build a binary spike raster aligned to the same window.
+    load_eye:
+        Also load calibrated horizontal/vertical eye position, aligned to the
+        same window. Each per-trial file's `eye_data/calib_horz`+`calib_vert`
+        share the same sample clock as `lfp_data` (verified empirically:
+        their peak deflection lines up with `match_on + reaction_time`, i.e.
+        the saccade to the match target, across many trials) but the
+        recording can end before the LFP window does, in which case the
+        tail is left as NaN.
     show_progress:
         Display a tqdm progress bar while reading per-trial files.
 
@@ -76,6 +86,8 @@ def load_session(
         Data variables:
             - `"lfp"`: dims `("trials", "roi", "time")`
             - `"spikes"` (only if `load_spike_times=True`): same dims, binary
+            - `"eye"` (only if `load_eye=True`): dims `("trials", "eye_axis",
+              "time")`, `eye_axis` coord `["horizontal", "vertical"]`
         Shared attrs: `nC`, `fsample`, `channels_labels`, `stim`, `indch`,
         `t_cue_on`, `t_cue_off`, `t_match_on`, `monkey`, `date`, `session`,
         `align_to`.
@@ -117,6 +129,7 @@ def load_session(
 
     lfp = np.empty((n_trials, n_channels, n_times))
     spikes = np.zeros((n_trials, n_channels, n_times), dtype=int) if load_spike_times else None
+    eye = np.full((n_trials, 2, n_times), np.nan) if load_eye else None
 
     trial_positions = trial_info["trial_index"].values
     iterator = tqdm(range(n_trials)) if show_progress else range(n_trials)
@@ -146,6 +159,16 @@ def load_session(
                     if len(frames) > 0:
                         spikes[i, ch, frames] = 1
 
+            if load_eye and "eye_data" in f:
+                eye_data = f["eye_data"]
+                for axis, mat_key in enumerate(("calib_horz", "calib_vert")):
+                    trace = np.asarray(eye_data[mat_key]).ravel()
+                    # The calibrated eye trace can end before the LFP window
+                    # does (see the load_eye docstring) -- whatever's past its
+                    # end is left as NaN rather than wrapping/erroring.
+                    seg = trace[indb:inde]
+                    eye[i, axis, : len(seg)] = seg
+
     stimulus = trial_info["sample_image"].values
     channels_labels = recording_info["channel_numbers"][indch]
     roi = np.array(recording_info["area"][indch], dtype="<U13")
@@ -159,6 +182,9 @@ def load_session(
     data_vars = {"lfp": (("trials", "roi", "time"), lfp)}
     if load_spike_times:
         data_vars["spikes"] = (("trials", "roi", "time"), spikes)
+    if load_eye:
+        coords["eye_axis"] = ["horizontal", "vertical"]
+        data_vars["eye"] = (("trials", "eye_axis", "time"), eye)
 
     ds = xr.Dataset(data_vars, coords=coords)
     ds.attrs = {

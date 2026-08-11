@@ -85,8 +85,12 @@ def _write_trial_info(path):
 
 
 def _write_trial_recording(path, rng: np.random.Generator):
-    """One per-trial raw recording: LFP for all channels + spike time references."""
+    """One per-trial raw recording: LFP for all channels + spike time references
+    + calibrated eye position (shorter than the LFP window, matching the real
+    per-trial files where eye_data/calib_horz+calib_vert end before lfp_data
+    does)."""
     lfp = rng.standard_normal((N_TRIAL_SAMPLES, N_CHANNELS_TOTAL))
+    n_eye_samples = N_TRIAL_SAMPLES - 200
     with h5py.File(path, "w") as f:
         f.create_dataset("lfp_data", data=lfp)
 
@@ -99,6 +103,20 @@ def _write_trial_recording(path, rng: np.random.Generator):
             refs.append(ds.ref)
         ref_ds = f.create_dataset("spike_times", (1, N_CHANNELS_TOTAL), dtype=ref_dtype)
         ref_ds[0, :] = refs
+
+        eye_grp = f.create_group("eye_data")
+        eye_grp.create_dataset(
+            "calib_horz", data=rng.standard_normal((n_eye_samples, 1))
+        )
+        eye_grp.create_dataset(
+            "calib_vert", data=rng.standard_normal((n_eye_samples, 1))
+        )
+        eye_grp.create_dataset(
+            "raw_horz", data=rng.standard_normal((n_eye_samples * 30, 1))
+        )
+        eye_grp.create_dataset(
+            "raw_vert", data=rng.standard_normal((n_eye_samples * 30, 1))
+        )
 
 
 @pytest.fixture
