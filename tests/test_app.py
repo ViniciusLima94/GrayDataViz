@@ -36,7 +36,7 @@ def test_build_app_smoke(data_config):
     widgets["Trial"].value = other_trials[0]
 
     widgets["Overlay spikes"].value = True
-    widgets["Apply bandpass filter (trace, PSD & coherence)"].value = True
+    widgets["Apply bandpass filter (trace, PSD, coherence & GC)"].value = True
     widgets["Band preset"].value = widgets["Band preset"].options[0]
 
     # Spike-triggered average, PAC, and phase coupling each have their own
@@ -87,7 +87,24 @@ def test_selecting_two_channels_shows_coherence_layout(data_config):
     main_column = tabs.objects[0]
     assert len(main_column.objects) == 3
     bottom_row = main_column.objects[2]
-    assert len(bottom_row.objects) == 3  # psd, coherence, psd
+    assert len(bottom_row.objects) == 2  # dual-axis psd (both channels), coherence
+
+
+def test_gc_checkbox_adds_pane_for_two_channels(data_config):
+    app = build_app(config=data_config)
+    widgets = _collect_widgets(app)
+
+    channel_select = widgets[_CHANNEL_LABEL]
+    channel_select.value = list(channel_select.options.values())[:2]
+
+    tabs = app.main.objects[0]
+    main_column = tabs.objects[0]
+    bottom_row = main_column.objects[2]
+    assert len(bottom_row.objects) == 2  # GC off by default: dual-axis psd, coherence
+
+    widgets["Granger causality spectrum (2 channels, pyGC — slower, off by default)"].value = True
+    bottom_row = main_column.objects[2]
+    assert len(bottom_row.objects) == 3  # dual-axis psd, coherence, GC
 
 
 def test_selecting_more_than_two_channels_is_truncated(data_config):

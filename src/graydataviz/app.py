@@ -7,7 +7,9 @@ top of the raw signal, and see each trace's power spectrum (multitaper,
 matching phase_coupling_analysis's xr_psd_array_multitaper params) below it.
 When two channels are selected, their coherence (multitaper, matching
 phase_coupling_analysis's conn_spec_average params) is shown between the two
-power spectra instead. A Hilbert decomposition panel (envelope and/or
+power spectra instead, with an optional non-parametric spectral Granger
+causality panel (pyGC, matching phase_coupling_analysis's conn_gc_average
+params) next to it. A Hilbert decomposition panel (envelope and/or
 instantaneous phase, matching phase_coupling_analysis's hilbert_decomposition:
 bandpass filter then scipy.signal.hilbert) can be shown below the LFP trace,
 along with spike-triggered average, phase-amplitude coupling (Tort modulation
@@ -39,6 +41,18 @@ from mne.time_frequency import psd_array_multitaper
 from scipy import stats as scipy_stats
 from scipy.signal import hilbert as scipy_hilbert
 
+try:
+    # Sibling package, not on PyPI (the "pygc" name there belongs to an
+    # unrelated project) -- install with `pip install -e ../pyGC`, matching
+    # how phase_coupling_analysis itself depends on it. Optional: the rest of
+    # the app works without it, just without the Granger causality panel.
+    from pygc import granger_causality
+
+    _PYGC_AVAILABLE = True
+except ImportError:
+    granger_causality = None
+    _PYGC_AVAILABLE = False
+
 from .config import DataConfig, default_config
 from .discovery import list_dates, list_monkeys, list_sessions
 from .exceptions import GrayDataVizError
@@ -48,6 +62,14 @@ from .session import load_session
 from .trials import BehavioralResponse, TrialType
 
 pn.extension()
+
+# Preferred initial monkey/date on launch, when available on disk -- both
+# `Select` widgets otherwise default to the first option alphabetically
+# (`list_monkeys`/`list_dates` both sort), which put "ethyl" first even
+# though most of the reference screenshots/figures here use lucy/141017.
+# Falls back to that alphabetical-first behavior if either isn't present.
+_DEFAULT_MONKEY = "lucy"
+_DEFAULT_DATE = "141017"
 
 # Validated categorical palette (see the dataviz skill's reference palette):
 # slot 1 blue / slot 2 orange, so identity stays consistent between the
@@ -72,6 +94,10 @@ _PSD_FMAX = 80.0
 _COH_BANDWIDTH = 5.0
 _COH_FMIN = 0.1
 _COH_FMAX = 80.0
+
+# Granger causality reuses the exact same bandwidth/fmin/fmax -- savegc.py
+# passes conn_gc_average the identical values savecoherence.py passes
+# conn_spec_average, so the two panels are directly comparable.
 
 _PAC_N_BINS = 18
 _SPIKE_PHASE_N_BINS = 18
@@ -172,6 +198,37 @@ def _coherence_all_trials(
     sxy = (wy * np.conj(wx)).mean(axis=axes)
     coh = np.abs(sxy) ** 2 / (sxx * syy)
     return freqs, coh
+
+
+def _gc_all_trials(
+    x: np.ndarray, y: np.ndarray, fsample: float
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Pairwise non-parametric spectral Granger causality between `x` and `y`
+    (`(n_trials, n_times)`), matching `conn_gc_average`'s pyGC call in
+    phase_coupling_analysis/src/metrics/granger.py: one multitaper
+    cross-spectral density + Wilson (1972) spectral factorization per pair,
+    which returns both directions from a single factorization. As in
+    `conn_gc_average`, `fmin`/`fmax` are applied only *after* factorization
+    (Wilson factorization needs the cross-spectral density sampled uniformly
+    over the full 0-Nyquist band to correctly reconstruct the causal transfer
+    function) -- unlike `_coherence_all_trials`, which can pass them straight
+    into the spectral estimator.
+
+    Returns `(freqs, gc_x_to_y, gc_y_to_x)`.
+    """
+    pair = np.stack([x, y], axis=1)  # (trials, 2, times)
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        ix2y, iy2x, _, freqs = granger_causality(
+            pair,
+            fsample,
+            spectral_method="multitaper",
+            backend="numpy",
+            verbose=False,
+            spectral_params={"bandwidth": _COH_BANDWIDTH, "n_jobs": 1},
+        )
+    freqs = np.asarray(freqs)
+    fmask = (freqs >= _COH_FMIN) & (freqs <= min(_COH_FMAX, fsample / 2))
+    return freqs[fmask], np.asarray(ix2y)[fmask], np.asarray(iy2x)[fmask]
 
 
 def _hilbert_analytic(x: np.ndarray, fsample: float, low: float, high: float) -> np.ndarray:
@@ -359,11 +416,15 @@ def _trial_label(trial_info: pd.DataFrame, trial_index: int) -> str:
     return f"Trial {trial_index} — {ttype}, {resp_label}"
 
 
-def _legend_above(ax, n_entries: int, fontsize: int = 8) -> None:
+def _legend_above(ax, n_entries: int, fontsize: int = 8, handles=None, labels=None) -> None:
     """Legend as a horizontal strip above the axes (never inside the plot
     area, where it covers data) -- combine with `pad=` on `ax.set_title` (if
-    any) so the title sits above this strip rather than overlapping it."""
+    any) so the title sits above this strip rather than overlapping it.
+    `handles`/`labels` let a twin-axes plot (e.g. `_dual_psd_figure`) combine
+    both axes' entries into one legend instead of `ax`'s own alone."""
+    kw = {} if handles is None else dict(handles=handles, labels=labels)
     ax.legend(
+        **kw,
         loc="lower center", bbox_to_anchor=(0.5, 1.0), ncol=min(max(n_entries, 1), 4),
         fontsize=fontsize, frameon=False, handlelength=1.5, columnspacing=1.2,
         borderaxespad=0,
@@ -384,6 +445,38 @@ def _psd_figure(
     if title:
         ax.set_title(title, fontsize=9, pad=26)
     _legend_above(ax, len(series))
+    return fig
+
+
+def _dual_psd_figure(
+    series1: list[tuple[np.ndarray, np.ndarray, str, str]],
+    series2: list[tuple[np.ndarray, np.ndarray, str, str]],
+    label1: str,
+    label2: str,
+    figsize: tuple[float, float],
+) -> Figure:
+    """Both channels' power spectra on one plot, `label1` on the left y-axis
+    and `label2` on the right (`ax.twinx()`), sharing the x-axis. Channel
+    identity is both color (`series1`/`series2` are pre-colored by the
+    caller -- `_COLOR_RAW`/`_COLOR_FILTERED` when not split by stimulus,
+    matching the two-channel LFP trace's own fixed channel-1/channel-2
+    colors) and linestyle (solid = `label1`, dashed = `label2`), the latter
+    still needed on its own when split by stimulus, where color instead
+    varies per stimulus and is shared between both channels.
+    """
+    fig = Figure(figsize=figsize)
+    ax1 = fig.add_subplot(111)
+    ax2 = ax1.twinx()
+    for freqs, psd, color, label in series1:
+        ax1.plot(freqs, psd, color=color, lw=1.5, linestyle="-", label=f"{label1}: {label}")
+    for freqs, psd, color, label in series2:
+        ax2.plot(freqs, psd, color=color, lw=1.5, linestyle="--", label=f"{label2}: {label}")
+    ax1.set_xlabel("Frequency (Hz)")
+    ax1.set_ylabel(f"PSD (µV²/Hz) — {label1} (solid)")
+    ax2.set_ylabel(f"PSD (µV²/Hz) — {label2} (dashed)")
+    handles1, labels1 = ax1.get_legend_handles_labels()
+    handles2, labels2 = ax2.get_legend_handles_labels()
+    _legend_above(ax1, len(handles1) + len(handles2), handles=handles1 + handles2, labels=labels1 + labels2)
     return fig
 
 
@@ -431,6 +524,49 @@ def _coherence_figure(
     ax.set_ylabel("Coherence")
     ax.set_title(f"Coherence: {label1} vs {label2}", fontsize=9, pad=26)
     _legend_above(ax, len(series))
+    return fig
+
+
+def _gc_figure(
+    series: list[tuple[np.ndarray, np.ndarray, np.ndarray, str, str, str]],
+    label1: str,
+    label2: str,
+    figsize: tuple[float, float],
+) -> Figure:
+    """`series`: `(freqs, gc_x_to_y, gc_y_to_x, color_xy, color_yx, label)`
+    -- one entry per stimulus group (or a single ungrouped entry), each
+    contributing two lines: solid `label1`->`label2` in `color_xy` (the
+    color of the channel the arrow originates from), dashed `label2`->
+    `label1` in `color_yx`. When not split by stimulus, `color_xy`/
+    `color_yx` are `_COLOR_RAW`/`_COLOR_FILTERED` -- the same fixed identity
+    colors as `label1`/`label2`'s own PSD lines and the LFP trace -- so a
+    direction's line always matches its source channel's color elsewhere on
+    the page; when split by stimulus the two are equal (that stimulus's
+    color) and only linestyle tells the directions apart."""
+    fig = Figure(figsize=figsize)
+    ax = fig.add_subplot(111)
+    for freqs, gc_xy, gc_yx, color_xy, color_yx, glabel in series:
+        prefix = f"{glabel} " if glabel else ""
+        ax.plot(freqs, gc_xy, color=color_xy, lw=1.5, linestyle="-", label=f"{prefix}{label1}→{label2}")
+        ax.plot(freqs, gc_yx, color=color_yx, lw=1.5, linestyle="--", label=f"{prefix}{label2}→{label1}")
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel("Granger causality")
+    ax.set_title(f"Spectral GC: {label1} vs {label2}", fontsize=9, pad=26)
+    _legend_above(ax, len(series) * 2)
+    return fig
+
+
+def _gc_unavailable_figure(figsize: tuple[float, float]) -> Figure:
+    fig = Figure(figsize=figsize)
+    ax = fig.add_subplot(111)
+    ax.text(
+        0.5, 0.5, "pyGC not installed\n(pip install -e ../pyGC)",
+        ha="center", va="center", fontsize=8, color="0.5", transform=ax.transAxes,
+    )
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
     return fig
 
 
@@ -512,7 +648,8 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
     config = config or default_config()
 
     monkeys = list_monkeys(config)
-    monkey_select = pn.widgets.Select(label="Monkey", options=monkeys)
+    default_monkey = _DEFAULT_MONKEY if _DEFAULT_MONKEY in monkeys else (monkeys[0] if monkeys else None)
+    monkey_select = pn.widgets.Select(label="Monkey", options=monkeys, value=default_monkey)
     date_select = pn.widgets.Select(label="Date", options=[])
     session_select = pn.widgets.Select(label="Session", options=[1])
     align_select = pn.widgets.RadioButtonGroup(
@@ -538,11 +675,16 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
     show_spikes = pn.widgets.Checkbox(label="Overlay spikes", value=False)
     show_events = pn.widgets.Checkbox(label="Show cue onset/offset & match onset", value=False)
     filter_enabled = pn.widgets.Checkbox(
-        label="Apply bandpass filter (trace, PSD & coherence)", value=False
+        label="Apply bandpass filter (trace, PSD, coherence & GC)", value=False
     )
     raw_band_select = pn.widgets.Select(label="Band preset", options=["custom"])
     raw_custom_low = pn.widgets.FloatInput(label="Low (Hz)", value=8.0, start=0.0)
     raw_custom_high = pn.widgets.FloatInput(label="High (Hz)", value=12.0, start=0.1)
+    show_gc = pn.widgets.Checkbox(
+        label="Granger causality spectrum (2 channels, pyGC — slower, off by default)",
+        value=False,
+        disabled=not _PYGC_AVAILABLE,
+    )
 
     # --- Spike-triggered average: its own filter/band, independent of the
     # raw trace's -- so the STA waveform doesn't silently change just because
@@ -649,8 +791,10 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
     lfp_pane = pn.pane.Bokeh(lfp_bokeh)
 
     psd_pane = pn.pane.Matplotlib(Figure(figsize=(4, 3)), tight=True, sizing_mode="stretch_width")
-    psd_pane_2 = pn.pane.Matplotlib(Figure(figsize=(4, 3)), tight=True, sizing_mode="stretch_width")
     coherence_pane = pn.pane.Matplotlib(
+        Figure(figsize=(4, 3)), tight=True, sizing_mode="stretch_width"
+    )
+    gc_pane = pn.pane.Matplotlib(
         Figure(figsize=(4, 3)), tight=True, sizing_mode="stretch_width"
     )
     envelope_bokeh, envelope_sources, envelope_lines = _make_linked_time_series_figure(
@@ -749,7 +893,7 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
     def _update_dates(_event=None):
         dates = list_dates(monkey_select.value, config) if monkey_select.value else []
         date_select.options = dates
-        date_select.value = dates[0] if dates else None
+        date_select.value = _DEFAULT_DATE if _DEFAULT_DATE in dates else (dates[0] if dates else None)
 
     def _update_sessions(_event=None):
         sessions = (
@@ -1108,13 +1252,17 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
                 spikes = ds.spikes.sel(trials=trial_index).isel(roi=ch_idx).values.astype(bool)
             return lfp, filtered, spikes
 
-        def _channel_psd_series(ch_idx):
+        def _channel_psd_series(ch_idx, color_override=None):
             # Filtered replaces raw (not layered on top of it) once a filter is
             # applied. One line per stimulus group when split_by_stimulus,
-            # otherwise the same single raw/filtered line as before.
+            # otherwise the same single raw/filtered line as before -- unless
+            # `color_override` is given (the two-channel view passes each
+            # channel's own fixed identity color, `_COLOR_RAW`/`_COLOR_FILTERED`,
+            # so raw vs filtered no longer overrides it and both channels stay
+            # distinguishable regardless of filter state).
             series = []
             for i, (glabel, gmask) in enumerate(stim_groups):
-                color = _STIMULUS_COLORS[i % len(_STIMULUS_COLORS)] if glabel else None
+                color = _STIMULUS_COLORS[i % len(_STIMULUS_COLORS)] if glabel else color_override
                 added = False
                 if filter_enabled.value:
                     try:
@@ -1170,6 +1318,54 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
                     )
                     series.append((freqs, coh, color or _COLOR_RAW, glabel or "raw"))
             return series
+
+        def _channel_gc_series(ch1_idx, ch2_idx):
+            # Each direction gets the color of the channel it originates from
+            # (ch1->ch2 = _COLOR_RAW, ch2->ch1 = _COLOR_FILTERED -- same
+            # fixed identity colors as the two-channel LFP trace and PSD
+            # panel), unless split by stimulus, where both directions share
+            # that stimulus's color and only linestyle (see `_gc_figure`)
+            # tells the two directions apart.
+            series = []
+            for i, (glabel, gmask) in enumerate(stim_groups):
+                stim_color = _STIMULUS_COLORS[i % len(_STIMULUS_COLORS)] if glabel else None
+                color_xy = stim_color or _COLOR_RAW
+                color_yx = stim_color or _COLOR_FILTERED
+                added = False
+                if filter_enabled.value:
+                    try:
+                        freqs, gc_xy, gc_yx = _cached_spectral(
+                            ("gc", ch1_idx, ch2_idx, "filt", raw_low, raw_high, glabel, subset_signature),
+                            lambda m=gmask: _gc_all_trials(
+                                _pooled_trials_filtered_for(ch1_idx, m, raw_low, raw_high),
+                                _pooled_trials_filtered_for(ch2_idx, m, raw_low, raw_high),
+                                fsample,
+                            ),
+                        )
+                        label = (
+                            f"{glabel} filtered {raw_band_label}" if glabel else f"filtered {raw_band_label}"
+                        )
+                        series.append((freqs, gc_xy, gc_yx, color_xy, color_yx, label))
+                        added = True
+                    except ValueError as exc:
+                        info_pane.object = f"**Filter error:** {exc}"
+                if not added:
+                    freqs, gc_xy, gc_yx = _cached_spectral(
+                        ("gc", ch1_idx, ch2_idx, "raw", glabel, subset_signature),
+                        lambda m=gmask: _gc_all_trials(
+                            _pooled_trials_raw_for(ch1_idx, m), _pooled_trials_raw_for(ch2_idx, m), fsample
+                        ),
+                    )
+                    series.append((freqs, gc_xy, gc_yx, color_xy, color_yx, glabel or "raw"))
+            return series
+
+        def _update_gc_pane(ch1_idx, ch2_idx, label1, label2) -> bool:
+            if not (show_gc.value and _PYGC_AVAILABLE):
+                return False
+            gc_pane.object = _gc_figure(
+                _channel_gc_series(ch1_idx, ch2_idx), label1, label2, figsize=(4, 3)
+            )
+            return True
 
         def _update_hilbert_panes(channel_specs) -> list:
             # channel_specs: list of up to 2 raw signals (µV). Returns the list
@@ -1538,11 +1734,20 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
                 _event_times_for_trial(ds, trial_index, fsample),
             )
 
-            psd_pane.object = _psd_figure(_channel_psd_series(ch1_idx), figsize=(4, 3), title=label1)
-            psd_pane_2.object = _psd_figure(_channel_psd_series(ch2_idx), figsize=(4, 3), title=label2)
+            psd_pane.object = _dual_psd_figure(
+                _channel_psd_series(ch1_idx, color_override=_COLOR_RAW),
+                _channel_psd_series(ch2_idx, color_override=_COLOR_FILTERED),
+                label1, label2, figsize=(4, 3),
+            )
             coherence_pane.object = _coherence_figure(
                 _channel_coherence_series(ch1_idx, ch2_idx), label1, label2, figsize=(4, 3)
             )
+            spectral_panes = [psd_pane, coherence_pane]
+            if _update_gc_pane(ch1_idx, ch2_idx, label1, label2):
+                spectral_panes.append(gc_pane)
+            elif show_gc.value and not _PYGC_AVAILABLE:
+                gc_pane.object = _gc_unavailable_figure(figsize=(4, 3))
+                spectral_panes.append(gc_pane)
 
             hilbert_panes = _update_hilbert_panes([lfp1, lfp2])
             if _update_quantile_pane(ch1_idx, ch2_idx):
@@ -1561,7 +1766,7 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
                 [info_pane, lfp_pane]
                 + hilbert_panes
                 + ([pn.Row(*extras, sizing_mode="stretch_width")] if extras else [])
-                + [pn.Row(psd_pane, psd_pane_2, coherence_pane, sizing_mode="stretch_width")]
+                + [pn.Row(*spectral_panes, sizing_mode="stretch_width")]
             )
 
         row = metadata.trial_info.iloc[trial_index]
@@ -1585,7 +1790,7 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
         pn.layout.Divider(),
         "## Raw data plot",
         "Trial/channel selection, zoom, and overlays for the LFP trace above "
-        "(and its direct spectral view -- PSD/coherence).",
+        "(and its direct spectral view -- PSD/coherence/GC).",
         trial_select,
         channel_select,
         clear_channels_button,
@@ -1600,6 +1805,7 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
         raw_band_select,
         raw_custom_low,
         raw_custom_high,
+        show_gc,
         pn.layout.Divider(),
         "## Trial subset (pooled analyses)",
         "Restricts which trials feed PSD, coherence, and the analyses below. "
@@ -1674,6 +1880,7 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
         raw_band_select,
         raw_custom_low,
         raw_custom_high,
+        show_gc,
         hilbert_mode,
         phase_band_select,
         phase_custom_low,

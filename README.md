@@ -6,20 +6,20 @@ replacing the loading code duplicated across `GrayData-Analysis` (`GDa/`) and
 
 Phase 1 is a standalone, tested loading API. Phase 2 is a Panel-based GUI for
 browsing raw LFP recordings (in µV, mouse-zoomable), comparing two channels,
-and inspecting their power spectra, coherence, Hilbert envelope/phase,
-spike-triggered average, phase-amplitude coupling, spike-phase locking, and
-power-product quantile/phase-difference regions — all computed with the same
-multitaper/Hilbert parameters as `phase_coupling_analysis` where an
-equivalent exists there.
+and inspecting their power spectra, coherence, spectral Granger causality,
+Hilbert envelope/phase, spike-triggered average, phase-amplitude coupling,
+spike-phase locking, and power-product quantile/phase-difference regions —
+all computed with the same multitaper/Hilbert parameters as
+`phase_coupling_analysis` where an equivalent exists there.
 
 ## GUI
 
 ![Two channels (F1 ch 95, V1 ch 247) for lucy/141017, trial 99, with spikes overlaid](docs/screenshots/lucy_141017_V1_247_vs_F1_95_trial99.png)
 
-*Monkey lucy, date 141017, trial 99 (TASK, CORRECT), channels F1 (ch 95) and
+_Monkey lucy, date 141017, trial 99 (TASK, CORRECT), channels F1 (ch 95) and
 V1 (ch 247) with spikes overlaid — LFP traces on top, then each channel's
 power spectrum and their coherence below, all averaged over every trial in
-the session.*
+the session._
 
 - **Session picker**: monkey → date → session → cue/match alignment, all
   auto-discovered from disk (see [Loading API](#loading-api) below).
@@ -31,6 +31,21 @@ the session.*
   (`Clear selection` resets it). One channel shows its LFP trace and power
   spectrum. Two channels overlay both LFP traces in one plot and add a
   coherence panel between their two power spectra.
+- **Granger causality spectrum** (two channels only, off by default):
+  non-parametric spectral GC — multitaper cross-spectral density + Wilson
+  (1972) factorization via the sibling
+  [`pyGC`](https://github.com/ViniciusLima94/pyGC) package, matching
+  `phase_coupling_analysis`'s `conn_gc_average`/`savegc_no_stim.py` params
+  exactly (same bandwidth/fmin/fmax as coherence). Shown as a fourth panel
+  next to PSD/PSD/coherence, one solid line per direction
+  (channel1→channel2) and one dashed (channel2→channel1). It's opt-in and
+  off by default because factorizing one channel pair takes roughly a
+  second (vs. sub-100ms for coherence) — toggling it on only recomputes when
+  the channel pair, filter, or trial-subset selection actually changes
+  (same caching as every other pooled analysis below). Requires `pygc`
+  installed from the sibling repo (`pip install -e ../pyGC`) — the checkbox
+  is disabled and the panel shows an install hint if it isn't found; the
+  rest of the app is unaffected either way.
 - **Include slvr/ms_mod-flagged channels** / **Unique recordings only**:
   toggle the two channel-filtering behaviors `load_session` supports, instead
   of them being silently baked in.
@@ -43,8 +58,8 @@ the session.*
 - **Apply bandpass filter**: pick a per-monkey band preset (from
   `phase_coupling_analysis/config.py`'s `bands`) or a custom range. When
   enabled, the filtered signal **replaces** the raw one everywhere it's used
-  as a per-trial trace (LFP trace, power spectra, coherence, spike-triggered
-  average) rather than overlaying both.
+  as a per-trial trace (LFP trace, power spectra, coherence, Granger
+  causality, spike-triggered average) rather than overlaying both.
 - **Hilbert decomposition**: envelope and/or instantaneous phase (band-filter
   then `scipy.signal.hilbert`, matching `phase_coupling_analysis`'s
   `hilbert_decomposition`), using the band controls above, shown as its own
@@ -56,7 +71,7 @@ the session.*
   - **Spike-triggered average (µV)** — mean LFP waveform in a ±0.25s window
     around each spike, computed on the filtered signal instead of raw when
     the bandpass filter above is enabled (same "filtered replaces raw" rule).
-    Unlike the quantile/phase-difference panels below, this pools the *full*
+    Unlike the quantile/phase-difference panels below, this pools the _full_
     trial window (no -0.5s-to-match-onset trim) — there's no evidence the
     reference pipeline restricts STA that way, that trim is specific to
     `save_burst_trains.py`'s burst-detection logic. **Include cross-channel
@@ -88,17 +103,18 @@ the session.*
     of those same quartiles and see the two channels' instantaneous phase
     difference, pooled across every trial (same -0.5s-to-match-onset window
     as above) and restricted to samples in that power-product quartile, as
-    an area-true circular histogram (bin *area*, not radius, encodes
+    an area-true circular histogram (bin _area_, not radius, encodes
     frequency — see `plot_.py`'s `circular_hist`) with the circular mean and
     standard deviation in its title. The two channels are always ordered
     alphabetically by `{roi}_{channel}` before subtracting phases (`phase(A)
     - phase(B)`, stated above the plot) to match
-    `phase_coupling_analysis/src/metrics/phase.py`'s pairing convention —
-    picking the same two channels in the opposite order in the selector
-    doesn't change anything, since std is sign-symmetric but the mean/the
-    histogram's orientation would otherwise flip depending on click order.
+`phase_coupling_analysis/src/metrics/phase.py`'s pairing convention —
+      picking the same two channels in the opposite order in the selector
+      doesn't change anything, since std is sign-symmetric but the mean/the
+      histogram's orientation would otherwise flip depending on click order.
 
 ![Power-product quantile regions and phase-difference circular plot for lucy/141017, trial 99, channels F1 (ch 63) vs V1 (ch 212)](docs/screenshots/lucy_141017_quantile_phasediff.png)
+
 - **Power spectra, coherence, and the additional analyses all use every
   trial** in the session for the selected channel(s) — not just the one
   currently selected for the raw trace — matching how
@@ -143,6 +159,7 @@ Run it with:
 
 ```bash
 pip install -e ".[gui]"        # panel, matplotlib, mne
+pip install -e ../pyGC         # optional: Granger causality panel (sibling repo, not on PyPI)
 graydataviz-gui
 # or
 python -m graydataviz.app
@@ -152,6 +169,76 @@ By default it points at `DataConfig()` (`GRAYDATAVIZ_RAW_ROOT` /
 `GRAYDATAVIZ_RESULTS_ROOT`, or `~/funcog/gda/GrayLab` / `~/funcog/gda/Results`
 if unset). Set those env vars to point at wherever the raw data actually
 lives before launching.
+
+Launching and restarting the server
+
+Quick start (foreground):
+
+```bash
+# Launch in the foreground (Ctrl+C to stop)
+python -m graydataviz.app
+# or the console script
+graydataviz-gui
+```
+
+Run in the background (simple, no supervisor):
+
+```bash
+# Use nohup to keep the process after logout and redirect output to a log
+nohup python -m graydataviz.app > /var/log/graydataviz.log 2>&1 &
+# Save the emitted PID (example)
+echo $! > /var/run/graydataviz.pid
+```
+
+Restarting the server
+
+- If running in the foreground: stop with Ctrl+C and re-run the same launch command.
+- If started with nohup (or backgrounded):
+  1. Stop: kill the PID recorded in /var/run/graydataviz.pid (replace with the actual path where you stored it):
+
+```bash
+kill $(cat /var/run/graydataviz.pid)
+```
+
+2. Start again using the same nohup command above.
+
+Manage with systemd (recommended for production-like setups)
+
+Create a unit file, e.g. `/etc/systemd/system/graydataviz.service`:
+
+```ini
+[Unit]
+Description=GrayDataViz Panel GUI
+After=network.target
+
+[Service]
+Type=simple
+User=your_user
+WorkingDirectory=/path/to/your/checkout
+Environment="PYTHONPATH=/path/to/your/checkout"
+ExecStart=/usr/bin/env python -m graydataviz.app
+Restart=on-failure
+RestartSec=5s
+StandardOutput=append:/var/log/graydataviz.log
+StandardError=append:/var/log/graydataviz.log
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Then enable/start/restart with:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now graydataviz.service
+sudo systemctl restart graydataviz.service
+sudo journalctl -u graydataviz.service -f
+```
+
+Notes
+
+- The GUI can also be served programmatically with Panel's `pn.serve(build_app, ...)` to pass extra options (port, address, basic_auth, cookie_secret) — see the "Sharing the GUI over the internet" section below for an example. If using `pn.serve` directly, integrate it with your process supervisor (systemd, tmux, screen, or a container).
+- For quick sharing over the internet, a Cloudflare tunnel (`cloudflared tunnel --url http://localhost:<port>`) is a convenient option; see the "Sharing the GUI over the internet" section below for details.
 
 ## Sharing the GUI over the internet
 
@@ -213,7 +300,7 @@ power-product quantile panels is a server-rendered PNG (`pn.pane.Matplotlib`,
 not a Bokeh-native chart, including the phase-difference circular plot), so
 there's no numeric data embedded in the page for those to extract via dev
 tools. Those four are the deliberate exception — they're interactive Bokeh
-charts (linked zoom, see above), which means the *currently displayed*
+charts (linked zoom, see above), which means the _currently displayed_
 trial/channel's samples are inspectable via the browser's dev tools (not the
 rest of the dataset, and not through any export/download endpoint — the app
 doesn't have one). Worth knowing if "not downloadable" needs to be airtight
@@ -243,7 +330,7 @@ rather than just "no bulk access."
   of bare integer codes.
 - **Descriptive errors**: missing raw/derived files raise
   `RawDataNotFoundError` / `DerivedDataNotFoundError` naming the exact path
-  (and, for derived products, what files *are* present in that directory)
+  (and, for derived products, what files _are_ present in that directory)
   instead of a bare `FileNotFoundError` from deep inside `xarray`/`h5py`.
 
 ```python
@@ -281,7 +368,7 @@ src/graydataviz/
 ├── derived.py    # load_power / load_pec_strength / load_crackle_cooccurrence / load_burst_probability
 ├── stimuli.py    # get_stimulus_image / get_stimulus_name (from embedded image_data)
 ├── filters.py    # bandpass_filter (zero-phase Butterworth), per-monkey DEFAULT_BANDS
-├── app.py        # Panel GUI (build_app / main): LFP trace, multitaper power spectra, coherence
+├── app.py        # Panel GUI (build_app / main): LFP trace, multitaper power spectra, coherence, GC
 └── exceptions.py
 ```
 
