@@ -40,13 +40,14 @@ from bokeh.plotting import figure as bokeh_figure
 from mne.time_frequency import psd_array_multitaper
 from scipy import stats as scipy_stats
 from scipy.signal import hilbert as scipy_hilbert
+from scipy.signal import butter, sosfiltfilt
 
 try:
     # Sibling package, not on PyPI (the "pygc" name there belongs to an
     # unrelated project) -- install with `pip install -e ../pyGC`, matching
     # how phase_coupling_analysis itself depends on it. Optional: the rest of
     # the app works without it, just without the Granger causality panel.
-    from pygc import granger_causality
+    from pygc import spectral_granger_causality
 
     _PYGC_AVAILABLE = True
 except ImportError:
@@ -218,7 +219,7 @@ def _gc_all_trials(
     """
     pair = np.stack([x, y], axis=1)  # (trials, 2, times)
     with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
-        ix2y, iy2x, _, freqs = granger_causality(
+        ds_gc = spectral_granger_causality(
             pair,
             fsample,
             spectral_method="multitaper",
@@ -226,6 +227,7 @@ def _gc_all_trials(
             verbose=False,
             spectral_params={"bandwidth": _COH_BANDWIDTH, "n_jobs": 1},
         )
+    ix2y, iy2x, freqs = ds_gc["x2y"][0], ds_gc["y2x"][0],ds_gc["freq"]
     freqs = np.asarray(freqs)
     fmask = (freqs >= _COH_FMIN) & (freqs <= min(_COH_FMAX, fsample / 2))
     return freqs[fmask], np.asarray(ix2y)[fmask], np.asarray(iy2x)[fmask]
@@ -383,6 +385,221 @@ def _cached_metadata(config: DataConfig, monkey: str, date: str, session: int) -
     return load_session_metadata(monkey, date, session, config=config)
 
 
+def _detect_microsaccades(
+    eye,
+    fsample,
+    velocity_threshold=10.0,
+    lowpass_hz=40.0,
+    min_duration_ms=10.0,
+    min_separation_ms=50.0,
+):
+    """
+    Detect microsaccades from calibrated eye position.
+
+    Parameters
+    ----------
+    eye : np.ndarray
+        Eye position with shape (n_trials, 2, n_times), where axis 1 is
+        [horizontal, vertical] and position is in degrees of visual angle.
+    fsample : float
+        Eye sampling frequency in Hz.
+    velocity_threshold : float
+        Microsaccade velocity threshold in dva/s.
+    lowpass_hz : float
+        Low-pass cutoff frequency for eye position, in Hz.
+    min_duration_ms : float
+        Minimum duration of a microsaccade in milliseconds.
+    min_separation_ms : float
+        Minimum separation between microsaccades in milliseconds.
+
+    Returns
+    -------
+    result : dict
+        Dictionary containing:
+
+        "filtered_eye"
+            Low-pass filtered eye position, same shape as `eye`.
+
+        "velocity"
+            2-D eye velocity magnitude in dva/s, shape
+            (n_trials, n_times).
+
+        "is_microsaccade"
+            Boolean mask of detected microsaccade samples, shape
+            (n_trials, n_times).
+
+        "events"
+            List of lists. Each trial contains dictionaries with:
+            start_idx, end_idx, peak_idx, start_time, end_time,
+            peak_time, duration_ms, peak_velocity.
+    """
+    eye = np.asarray(eye, dtype=float)
+
+    if eye.ndim != 3:
+        raise ValueError(
+            "eye must have shape (n_trials, 2, n_times)"
+        )
+
+    if eye.shape[1] != 2:
+        raise ValueError(
+            "eye axis 1 must contain [horizontal, vertical]"
+        )
+
+    n_trials, _, n_times = eye.shape
+
+    # ------------------------------------------------------------------
+    # 1. Low-pass filter eye position at 40 Hz
+    # ------------------------------------------------------------------
+    if lowpass_hz >= fsample / 2:
+        raise ValueError("lowpass_hz must be below the Nyquist frequency")
+
+    sos = butter(
+        N=4,
+        Wn=lowpass_hz,
+        btype="lowpass",
+        fs=fsample,
+        output="sos",
+    )
+
+    filtered_eye = np.full_like(eye, np.nan)
+
+    for trial in range(n_trials):
+        for axis in range(2):
+            x = eye[trial, axis]
+
+            valid = np.isfinite(x)
+
+            # Avoid filtering NaNs.
+            if valid.sum() >= 10:
+                filtered_eye[trial, axis, valid] = sosfiltfilt(
+                    sos,
+                    x[valid],
+                )
+
+    # ------------------------------------------------------------------
+    # 2. Differentiate position -> velocity
+    # ------------------------------------------------------------------
+    # np.gradient gives units of dva/s because position is dva and
+    # spacing is seconds.
+    vx = np.gradient(filtered_eye[:, 0], 1.0 / fsample, axis=-1)
+    vy = np.gradient(filtered_eye[:, 1], 1.0 / fsample, axis=-1)
+
+    velocity = np.sqrt(vx**2 + vy**2)
+
+    # ------------------------------------------------------------------
+    # 3. Threshold velocity
+    # ------------------------------------------------------------------
+    supra_threshold = velocity >= velocity_threshold
+
+    # Convert temporal criteria from ms to samples.
+    min_duration_samples = max(
+        1,
+        int(np.ceil(min_duration_ms / 1000.0 * fsample)),
+    )
+
+    min_separation_samples = max(
+        1,
+        int(np.ceil(min_separation_ms / 1000.0 * fsample)),
+    )
+
+    # ------------------------------------------------------------------
+    # 4. Detect contiguous supra-threshold periods
+    # ------------------------------------------------------------------
+    is_microsaccade = np.zeros(
+        (n_trials, n_times),
+        dtype=bool,
+    )
+
+    events = []
+
+    for trial in range(n_trials):
+        mask = supra_threshold[trial]
+
+        # Find contiguous True regions.
+        padded = np.pad(mask.astype(int), (1, 1))
+        changes = np.diff(padded)
+
+        starts = np.flatnonzero(changes == 1)
+        ends = np.flatnonzero(changes == -1) - 1
+
+        candidates = []
+
+        for start, end in zip(starts, ends):
+            duration = end - start + 1
+
+            if duration >= min_duration_samples:
+                peak_idx = start + np.argmax(
+                    velocity[trial, start:end + 1]
+                )
+
+                candidates.append(
+                    {
+                        "start_idx": int(start),
+                        "end_idx": int(end),
+                        "peak_idx": int(peak_idx),
+                        "peak_velocity": float(
+                            velocity[trial, peak_idx]
+                        ),
+                    }
+                )
+
+        # --------------------------------------------------------------
+        # 5. Enforce minimum 50 ms separation
+        # --------------------------------------------------------------
+        accepted = []
+
+        for candidate in candidates:
+            if not accepted:
+                accepted.append(candidate)
+                continue
+
+            previous = accepted[-1]
+
+            separation = (
+                candidate["start_idx"]
+                - previous["end_idx"]
+                - 1
+            )
+
+            if separation >= min_separation_samples:
+                accepted.append(candidate)
+            else:
+                # If two events are too close, retain the one with the
+                # larger peak velocity.
+                if (
+                    candidate["peak_velocity"]
+                    > previous["peak_velocity"]
+                ):
+                    accepted[-1] = candidate
+
+        # Mark accepted events.
+        trial_events = []
+
+        for event in accepted:
+            start = event["start_idx"]
+            end = event["end_idx"]
+            peak = event["peak_idx"]
+
+            is_microsaccade[trial, start:end + 1] = True
+
+            event["start_time"] = start / fsample
+            event["end_time"] = end / fsample
+            event["peak_time"] = peak / fsample
+            event["duration_ms"] = (
+                (end - start + 1) / fsample * 1000
+            )
+
+            trial_events.append(event)
+
+        events.append(trial_events)
+
+    return {
+        "filtered_eye": filtered_eye,
+        "velocity": velocity,
+        "is_microsaccade": is_microsaccade,
+        "events": events,
+    }
+
 @pn.cache
 def _cached_session(
     config: DataConfig,
@@ -398,8 +615,8 @@ def _cached_session(
         date,
         session,
         align_to=align_to,
-        exclude_slvr_msmod=exclude_slvr_msmod,
-        only_unique_recordings=only_unique_recordings,
+        exclude_slvr_msmod=False,
+        only_unique_recordings=False,
         load_spike_times=True,
         load_eye=True,
         config=config,
@@ -643,6 +860,10 @@ def _phase_diff_circular_figure(
             ax.set_title(f'{r["label"]}\n(no samples)', fontsize=9)
     return fig
 
+def _label(roi, ch, slvr, ms_mod):
+    flags = [f for f, on in (("slvr", slvr), ("ms_mod", ms_mod)) if on]
+    suffix = f"; {' '.join(flags)}" if flags else ""
+    return f"{roi} (ch {ch}{suffix})"
 
 def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
     config = config or default_config()
@@ -661,19 +882,19 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
     )
     clear_channels_button = pn.widgets.Button(label="Clear selection")
     include_flagged_channels = pn.widgets.Checkbox(
-        label="Include slvr/ms_mod-flagged channels", value=False
+        label="Include slvr/ms_mod-flagged channels", value=True
     )
     unique_recordings_only = pn.widgets.Checkbox(
-        label="Unique recordings only", value=False
+        label="Unique recordings only", value=True
     )
-
+    
     # --- Raw data plot: everything that changes what the LFP trace (and its
     # direct spectral view -- PSD/coherence) shows for the selected trial.
     zoom_start = pn.widgets.FloatInput(label="Zoom start (s)", value=0.0)
     zoom_end = pn.widgets.FloatInput(label="Zoom end (s)", value=0.0)
     reset_zoom_button = pn.widgets.Button(label="Reset zoom")
-    show_spikes = pn.widgets.Checkbox(label="Overlay spikes", value=False)
-    show_events = pn.widgets.Checkbox(label="Show cue onset/offset & match onset", value=False)
+    show_spikes = pn.widgets.Checkbox(label="Overlay spikes", value=True)
+    show_events = pn.widgets.Checkbox(label="Show cue onset/offset & match onset", value=True)
     filter_enabled = pn.widgets.Checkbox(
         label="Apply bandpass filter (trace, PSD, coherence & GC)", value=False
     )
@@ -681,7 +902,7 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
     raw_custom_low = pn.widgets.FloatInput(label="Low (Hz)", value=8.0, start=0.0)
     raw_custom_high = pn.widgets.FloatInput(label="High (Hz)", value=12.0, start=0.1)
     show_gc = pn.widgets.Checkbox(
-        label="Granger causality spectrum (2 channels, pyGC — slower, off by default)",
+        label="Granger causality spectrum (2 channels)",
         value=False,
         disabled=not _PYGC_AVAILABLE,
     )
@@ -863,12 +1084,6 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
         montage_bokeh.add_layout(span)
     montage_pane = pn.pane.Bokeh(montage_bokeh)
     montage_caption = pn.pane.Markdown(
-        "*Selected channels below (independent of the channel(s) picked for "
-        "the trace/spectral view; defaults to every currently-loaded channel, "
-        "respecting the flagged-channel/unique-recordings filters above), "
-        "z-scored and stacked, for the selected trial. Eye position "
-        "(horizontal/vertical) is shown in red at the top. Task markers "
-        "match \"Show cue onset/offset & match onset\" above.*",
         styles={"font-size": "0.85em", "color": "#666"},
     )
     montage_channel_select = pn.widgets.MultiSelect(
@@ -977,9 +1192,12 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
         trial_select.value = next(iter(trial_options.values()))
 
         channel_options = {
-            f"{roi} (ch {ch})": i
-            for i, (roi, ch) in enumerate(zip(ds.roi.values, ds.attrs["channels_labels"]))
+            _label(roi, ch, slvr, ms_mod): i
+            for i, (roi, ch, slvr, ms_mod) in enumerate(
+                zip(ds.roi.values, ds.attrs["channels_labels"], ds.attrs["slvr"], ds.attrs["ms_mod"])
+            )
         }
+
         channel_select.options = channel_options
         channel_select.value = [next(iter(channel_options.values()))]
         montage_channel_select.options = channel_options
@@ -1029,7 +1247,8 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
         # (rather than an absolute spacing value) is what the slider drives.
         amplitude_scale = _MONTAGE_ROW_UNIT / float(montage_spacing_slider.value)
         n_eye_rows = 2 if has_eye else 0
-        total_rows = n_channels + n_eye_rows + (1 if has_eye else 0)  # +1 gap row
+        n_microsaccade_rows = 1 if has_eye else 0
+        total_rows = n_channels + n_eye_rows + n_microsaccade_rows + (1 if has_eye else 0)  # +1 gap row
         pos = total_rows
 
         xs, ys, colors, ticks, labels = [], [], [], [], []
@@ -1048,6 +1267,7 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
         if has_eye:
             pos -= 1  # gap row between LFP channels and eye traces
             eye_trial = ds.eye.sel(trials=trial_index).values  # (eye_axis, time)
+
             for axis_i, axis_label in enumerate(("Eye H", "Eye V")):
                 y = _zscore(eye_trial[axis_i]) * amplitude_scale + pos * _MONTAGE_ROW_UNIT
                 xs.append(time)
@@ -1057,6 +1277,26 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
                 labels.append(axis_label)
                 pos -= 1
 
+            # _detect_microsaccades expects (n_trials, 2, n_times); eye_trial is
+            # alre{ady sliced to this one trial (2, n_times), so add back a dummy
+            # trials axis and unwrap the (1, n_times) result with [0]. Use the
+            # local `fsample` (ds.attrs["fsample"]) -- `ds.fsample` isn't a real
+            # attribute and raises AttributeError.
+            result = _detect_microsaccades(
+                eye_trial[None, :, :], fsample=fsample
+            )
+            microsaccades = result["is_microsaccade"][0]
+            print(f"microsaccades detected: {microsaccades.sum()} / {len(microsaccades)} samples, "
+                f"max velocity: {np.nanmax(result['velocity']):.2f} dva/s, "
+                f"eye value range: {np.nanmin(eye_trial):.3f} to {np.nanmax(eye_trial):.3f}")
+            y = microsaccades.astype(float) * amplitude_scale + pos * _MONTAGE_ROW_UNIT
+            xs.append(time)
+            ys.append(y)
+            colors.append("#000000")
+            ticks.append(pos * _MONTAGE_ROW_UNIT)
+            labels.append("microsaccades")
+            pos -= 1
+
         montage_source.data = dict(xs=xs, ys=ys, color=colors)
         montage_bokeh.yaxis.ticker = FixedTicker(ticks=ticks)
         montage_bokeh.yaxis.major_label_overrides = {t: lbl for t, lbl in zip(ticks, labels)}
@@ -1065,6 +1305,12 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
         montage_bokeh.height = montage_height_slider.value
 
         event_times = _event_times_for_trial(ds, trial_index, fsample)
+        match_on = event_times.get("match_on")
+        state["full_range"] = (
+            (-0.5, match_on + 0.5)
+            if match_on is not None and not np.isnan(match_on)
+            else (float(ds.time.values[0]), float(ds.time.values[-1]))
+        )  
         for key, sp in montage_event_spans.items():
             t = event_times.get(key)
             if t is not None:
@@ -1789,47 +2035,30 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
         align_select,
         pn.layout.Divider(),
         "## Raw data plot",
-        "Trial/channel selection, zoom, and overlays for the LFP trace above "
-        "(and its direct spectral view -- PSD/coherence/GC).",
         trial_select,
         channel_select,
         clear_channels_button,
-        include_flagged_channels,
-        unique_recordings_only,
-        zoom_start,
-        zoom_end,
-        reset_zoom_button,
-        show_spikes,
-        show_events,
-        filter_enabled,
-        raw_band_select,
-        raw_custom_low,
-        raw_custom_high,
-        show_gc,
-        pn.layout.Divider(),
-        "## Trial subset (pooled analyses)",
-        "Restricts which trials feed PSD, coherence, and the analyses below. "
-        "The trace above always shows the selected trial regardless.",
+        #include_flagged_channels,
+        #unique_recordings_only,
+        #zoom_start,
+        #zoom_end,
+        #reset_zoom_button,
+        #show_spikes,
+        #show_events,
+        #pn.layout.Divider(),
+        "### Trial subset (pooled analyses)",
         trial_type_filter,
         behavioral_response_filter,
         stimulus_filter,
         clear_trial_subset_button,
         subset_info_pane,
         pn.layout.Divider(),
-        "## Spike-triggered average",
-        show_sta,
-        show_cross_sta,
-        sta_filter_enabled,
-        sta_band_select,
-        sta_custom_low,
-        sta_custom_high,
-        pn.layout.Divider(),
-        "## Phase-amplitude coupling (PAC)",
-        show_pac,
-        pac_phase_low,
-        pac_phase_high,
-        pac_amp_low,
-        pac_amp_high,
+        "## Spectral analysis",
+        filter_enabled,
+        raw_band_select,
+        raw_custom_low,
+        raw_custom_high,
+        show_gc,
         pn.layout.Divider(),
         "## Phase coupling",
         hilbert_mode,
@@ -1839,6 +2068,21 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
         show_spike_phase,
         show_quantile_regions,
         phase_diff_bins,
+        "## Phase-amplitude coupling (PAC)",
+        show_pac,
+        pac_phase_low,
+        pac_phase_high,
+        pac_amp_low,
+        pac_amp_high,
+        pn.layout.Divider(),
+        "## Spike-triggered average",
+        show_sta,
+        show_cross_sta,
+        sta_filter_enabled,
+        sta_band_select,
+        sta_custom_low,
+        sta_custom_high,
+        pn.layout.Divider(),
     )
     main = pn.Column(info_pane, lfp_pane, psd_pane)
     montage_tab = pn.Column(

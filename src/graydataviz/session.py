@@ -200,6 +200,8 @@ def load_session(
         "date": date,
         "session": session,
         "align_to": align_to,
+        "slvr": recording_info["slvr"],
+        "ms_mod" : recording_info["ms_mod"]
     }
     return ds
 
