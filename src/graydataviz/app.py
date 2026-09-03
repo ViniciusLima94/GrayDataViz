@@ -680,6 +680,10 @@ def _dual_psd_figure(
     colors) and linestyle (solid = `label1`, dashed = `label2`), the latter
     still needed on its own when split by stimulus, where color instead
     varies per stimulus and is shared between both channels.
+
+    Kept for reference/backward-compat only -- the main two-channel view now
+    uses one dedicated `_psd_figure` per channel (see `_update_power_panes`)
+    instead of this combined twin-axes figure.
     """
     fig = Figure(figsize=figsize)
     ax1 = fig.add_subplot(111)
@@ -951,15 +955,15 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
     )
 
     trial_type_filter = pn.widgets.MultiSelect(
-        label="Trial type (none = all)",
+        label="Trial type (none = all; select 2+ to split power/coherence/GC into one line per type)",
         options=[t.name for t in TrialType], value=[], size=3,
     )
     behavioral_response_filter = pn.widgets.MultiSelect(
-        label="Behavioral response (none = all)",
+        label="Behavioral response (none = all; select 2+ to split power/coherence/GC, e.g. correct vs incorrect)",
         options=[r.name for r in BehavioralResponse], value=[], size=2,
     )
     stimulus_filter = pn.widgets.MultiSelect(
-        label="Stimulus label (none = all)", options=[], value=[], size=5,
+        label="Stimulus label (none = all; select 2+ to split power/coherence/GC)", options=[], value=[], size=5,
     )
     clear_trial_subset_button = pn.widgets.Button(label="Clear selection")
     subset_info_pane = pn.pane.Markdown("", styles={"font-size": "0.85em", "color": "#666"})
@@ -1237,6 +1241,8 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
             return
         trial_index = trial_select.value
         time = ds.time.values
+        t_min, t_max = time.min(), time.max()
+        
         fsample = float(ds.attrs["fsample"])
         selected_channels = sorted(montage_channel_select.value)
         n_channels = len(selected_channels)
@@ -1285,13 +1291,13 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
             result = _detect_microsaccades(
                 eye_trial[None, :, :], fsample=fsample
             )
-            microsaccades = result["is_microsaccade"][0]
-            print(f"microsaccades detected: {microsaccades.sum()} / {len(microsaccades)} samples, "
-                f"max velocity: {np.nanmax(result['velocity']):.2f} dva/s, "
-                f"eye value range: {np.nanmin(eye_trial):.3f} to {np.nanmax(eye_trial):.3f}")
-            y = microsaccades.astype(float) * amplitude_scale + pos * _MONTAGE_ROW_UNIT
+            events = result["events"][0]
             xs.append(time)
-            ys.append(y)
+            ys.append(np.zeros(len(time), dtype=bool))
+            for event in events:
+                ti = np.argmin( np.abs( time -  event["peak_time"] - t_min) )  # Timing index
+                ys[-1][ti] = True
+                
             colors.append("#000000")
             ticks.append(pos * _MONTAGE_ROW_UNIT)
             labels.append("microsaccades")
@@ -1300,14 +1306,23 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
         montage_source.data = dict(xs=xs, ys=ys, color=colors)
         montage_bokeh.yaxis.ticker = FixedTicker(ticks=ticks)
         montage_bokeh.yaxis.major_label_overrides = {t: lbl for t, lbl in zip(ticks, labels)}
-        montage_bokeh.y_range.start = -_MONTAGE_ROW_UNIT
-        montage_bokeh.y_range.end = (total_rows + 1) * _MONTAGE_ROW_UNIT
+
+        # Base the y-range on actual plotted values (not a fixed formula) so
+        # high-amplitude_scale/high-z-score peaks on the top channel never get
+        # clipped just because they exceed the nominal 1-row-unit spacing.
+        all_y_values = np.concatenate(ys) if ys[:-3] else np.array([0.0])
+        y_data_min = np.nanmin(all_y_values)
+        y_data_max = np.nanmax(all_y_values)
+        y_padding = 0.5 * _MONTAGE_ROW_UNIT
+        montage_bokeh.y_range.start = min(-_MONTAGE_ROW_UNIT, y_data_min - y_padding)
+        montage_bokeh.y_range.end = max((total_rows + 1) * _MONTAGE_ROW_UNIT, y_data_max + y_padding)
+
         montage_bokeh.height = montage_height_slider.value
 
         event_times = _event_times_for_trial(ds, trial_index, fsample)
         match_on = event_times.get("match_on")
         state["full_range"] = (
-            (-0.5, match_on + 0.5)
+            (t_min, t_max)#match_on + 0.5)
             if match_on is not None and not np.isnan(match_on)
             else (float(ds.time.values[0]), float(ds.time.values[-1]))
         )  
@@ -1427,43 +1442,59 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
             subset_mask = np.ones(len(ds.trials), dtype=bool)
             n_subset = len(ds.trials)
             subset_note = " (filter matched 0 trials — showing all trials instead)"
-        subset_signature = (
-            tuple(sorted(trial_type_filter.value)),
-            tuple(sorted(behavioral_response_filter.value)),
-            tuple(sorted(stimulus_filter.value)),
-        )
 
-        def _stimulus_groups() -> list[tuple[str | None, np.ndarray]]:
-            # When 2+ stimuli are selected, split into one (label, mask) pair
-            # per stimulus (each still respecting the trial type/behavioral
-            # response filters) so PSD/coherence/STA/phase-difference can
-            # overlay one curve per stimulus instead of pooling them together.
-            # With 0 or 1 stimuli selected, this is just the ordinary single
-            # combined subset (label=None, same as before this feature).
-            if len(stimulus_filter.value) < 2:
-                return [(None, subset_mask)]
-            base_mask = _trial_type_behavior_mask()
+        def _condition_groups() -> list[tuple[str | None, np.ndarray]]:
+            # Splits into one (label, mask) pair per value of whichever
+            # filter -- trial_type_filter, behavioral_response_filter, or
+            # stimulus_filter -- currently has 2+ values selected. Only ONE
+            # field is "active" as a split at a time (by design): if 2+ are
+            # selected in more than one filter simultaneously, trial_type
+            # takes priority over behavioral_response, which takes priority
+            # over stimulus. The other (non-active) filters, if they have
+            # exactly 0 or 1 value selected, still apply as plain filters via
+            # subset_mask/_trial_type_behavior_mask -- they just don't
+            # themselves contribute additional split lines. Replaces the
+            # earlier stimulus-only _stimulus_groups.
             rows = metadata.trial_info.iloc[ds.trials.values]
+            base_mask = _trial_type_behavior_mask()
+
+            if len(trial_type_filter.value) >= 2:
+                field = "trial_type"
+                values = trial_type_filter.value
+                conv = lambda v: TrialType[v].value
+            elif len(behavioral_response_filter.value) >= 2:
+                field = "behavioral_response"
+                values = behavioral_response_filter.value
+                conv = lambda v: BehavioralResponse[v].value
+            elif len(stimulus_filter.value) >= 2:
+                field = "sample_image"
+                values = stimulus_filter.value
+                conv = lambda v: int(v)
+            else:
+                return [(None, subset_mask)]
+
             groups = []
-            for stim in sorted(stimulus_filter.value, key=int):
-                stim_mask = base_mask & rows["sample_image"].isin([int(stim)]).to_numpy()
-                if stim_mask.sum() > 0:
-                    groups.append((f"Stim {stim}", stim_mask))
+            for v in sorted(values):
+                mask = base_mask & (rows[field] == conv(v)).to_numpy()
+                if stimulus_filter.value and field != "sample_image":
+                    mask &= rows["sample_image"].isin([int(s) for s in stimulus_filter.value]).to_numpy()
+                if mask.sum() > 0:
+                    groups.append((str(v), mask))
             return groups or [(None, subset_mask)]
 
-        stim_groups = _stimulus_groups()
-        split_by_stimulus = len(stim_groups) > 1
+        cond_groups = _condition_groups()
+        split_by_condition = len(cond_groups) > 1
 
-        if split_by_stimulus:
-            counts = ", ".join(f"{label}: {int(mask.sum())}" for label, mask in stim_groups)
+        if split_by_condition:
+            counts = ", ".join(f"{label}: {int(mask.sum())}" for label, mask in cond_groups)
             subset_info_pane.object = (
-                f"*PSD, coherence, STA, and phase-difference are split by stimulus "
+                f"*Power, coherence, GC, STA, and phase-difference are split by condition "
                 f"({counts} trials). PAC, spike-phase locking, and the quantile panel "
                 f"still pool all {n_subset}/{len(ds.trials)} matching trials together.*"
             )
         else:
             subset_info_pane.object = (
-                f"*Pooled analyses (PSD, coherence, STA, PAC, spike-phase, quantile/phase-diff) "
+                f"*Pooled analyses (power, coherence, GC, STA, PAC, spike-phase, quantile/phase-diff) "
                 f"use {n_subset}/{len(ds.trials)} trials.{subset_note}*"
             )
 
@@ -1500,20 +1531,22 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
 
         def _channel_psd_series(ch_idx, color_override=None):
             # Filtered replaces raw (not layered on top of it) once a filter is
-            # applied. One line per stimulus group when split_by_stimulus,
+            # applied. One line per condition group when split_by_condition,
             # otherwise the same single raw/filtered line as before -- unless
-            # `color_override` is given (the two-channel view passes each
-            # channel's own fixed identity color, `_COLOR_RAW`/`_COLOR_FILTERED`,
-            # so raw vs filtered no longer overrides it and both channels stay
-            # distinguishable regardless of filter state).
+            # `color_override` is given (the per-channel power panel passes
+            # each channel's own fixed identity color, `_COLOR_RAW`/
+            # `_COLOR_FILTERED`, so raw vs filtered no longer overrides it and
+            # a channel's color stays recognizable regardless of filter
+            # state; when split by condition, condition color takes priority
+            # over the channel-identity override).
             series = []
-            for i, (glabel, gmask) in enumerate(stim_groups):
+            for i, (glabel, gmask) in enumerate(cond_groups):
                 color = _STIMULUS_COLORS[i % len(_STIMULUS_COLORS)] if glabel else color_override
                 added = False
                 if filter_enabled.value:
                     try:
                         freqs, psd = _cached_spectral(
-                            ("psd", ch_idx, "filt", raw_low, raw_high, glabel, subset_signature),
+                            ("psd", ch_idx, "filt", raw_low, raw_high, glabel),
                             lambda m=gmask: _psd_all_trials(
                                 _pooled_trials_filtered_for(ch_idx, m, raw_low, raw_high), fsample
                             ),
@@ -1527,7 +1560,7 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
                         info_pane.object = f"**Filter error:** {exc}"
                 if not added:
                     freqs, psd = _cached_spectral(
-                        ("psd", ch_idx, "raw", glabel, subset_signature),
+                        ("psd", ch_idx, "raw", glabel),
                         lambda m=gmask: _psd_all_trials(_pooled_trials_raw_for(ch_idx, m), fsample),
                     )
                     series.append((freqs, psd, color or _COLOR_RAW, glabel or "raw"))
@@ -1535,13 +1568,13 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
 
         def _channel_coherence_series(ch1_idx, ch2_idx):
             series = []
-            for i, (glabel, gmask) in enumerate(stim_groups):
+            for i, (glabel, gmask) in enumerate(cond_groups):
                 color = _STIMULUS_COLORS[i % len(_STIMULUS_COLORS)] if glabel else None
                 added = False
                 if filter_enabled.value:
                     try:
                         freqs, coh = _cached_spectral(
-                            ("coh", ch1_idx, ch2_idx, "filt", raw_low, raw_high, glabel, subset_signature),
+                            ("coh", ch1_idx, ch2_idx, "filt", raw_low, raw_high, glabel),
                             lambda m=gmask: _coherence_all_trials(
                                 _pooled_trials_filtered_for(ch1_idx, m, raw_low, raw_high),
                                 _pooled_trials_filtered_for(ch2_idx, m, raw_low, raw_high),
@@ -1557,7 +1590,7 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
                         info_pane.object = f"**Filter error:** {exc}"
                 if not added:
                     freqs, coh = _cached_spectral(
-                        ("coh", ch1_idx, ch2_idx, "raw", glabel, subset_signature),
+                        ("coh", ch1_idx, ch2_idx, "raw", glabel),
                         lambda m=gmask: _coherence_all_trials(
                             _pooled_trials_raw_for(ch1_idx, m), _pooled_trials_raw_for(ch2_idx, m), fsample
                         ),
@@ -1568,20 +1601,20 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
         def _channel_gc_series(ch1_idx, ch2_idx):
             # Each direction gets the color of the channel it originates from
             # (ch1->ch2 = _COLOR_RAW, ch2->ch1 = _COLOR_FILTERED -- same
-            # fixed identity colors as the two-channel LFP trace and PSD
-            # panel), unless split by stimulus, where both directions share
-            # that stimulus's color and only linestyle (see `_gc_figure`)
-            # tells the two directions apart.
+            # fixed identity colors as the two-channel LFP trace and power
+            # panels), unless split by condition, where both directions share
+            # that group's color and only linestyle (see `_gc_figure`) tells
+            # the two directions apart.
             series = []
-            for i, (glabel, gmask) in enumerate(stim_groups):
-                stim_color = _STIMULUS_COLORS[i % len(_STIMULUS_COLORS)] if glabel else None
-                color_xy = stim_color or _COLOR_RAW
-                color_yx = stim_color or _COLOR_FILTERED
+            for i, (glabel, gmask) in enumerate(cond_groups):
+                cond_color = _STIMULUS_COLORS[i % len(_STIMULUS_COLORS)] if glabel else None
+                color_xy = cond_color or _COLOR_RAW
+                color_yx = cond_color or _COLOR_FILTERED
                 added = False
                 if filter_enabled.value:
                     try:
                         freqs, gc_xy, gc_yx = _cached_spectral(
-                            ("gc", ch1_idx, ch2_idx, "filt", raw_low, raw_high, glabel, subset_signature),
+                            ("gc", ch1_idx, ch2_idx, "filt", raw_low, raw_high, glabel),
                             lambda m=gmask: _gc_all_trials(
                                 _pooled_trials_filtered_for(ch1_idx, m, raw_low, raw_high),
                                 _pooled_trials_filtered_for(ch2_idx, m, raw_low, raw_high),
@@ -1597,13 +1630,27 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
                         info_pane.object = f"**Filter error:** {exc}"
                 if not added:
                     freqs, gc_xy, gc_yx = _cached_spectral(
-                        ("gc", ch1_idx, ch2_idx, "raw", glabel, subset_signature),
+                        ("gc", ch1_idx, ch2_idx, "raw", glabel),
                         lambda m=gmask: _gc_all_trials(
                             _pooled_trials_raw_for(ch1_idx, m), _pooled_trials_raw_for(ch2_idx, m), fsample
                         ),
                     )
                     series.append((freqs, gc_xy, gc_yx, color_xy, color_yx, glabel or "raw"))
             return series
+
+        def _update_power_panes() -> list[pn.pane.Matplotlib]:
+            # One dedicated, fixed-size Matplotlib pane per selected channel
+            # -- replaces the old combined/twin-axes PSD panel. When
+            # split_by_condition, each pane overlays one line per condition
+            # group (task/fix_blocked/fix_interleaved, correct/incorrect,
+            # etc.), using the same _channel_psd_series every other analysis
+            # panel already relies on.
+            panes = []
+            for ch_idx in selected:
+                series = _channel_psd_series(ch_idx, color_override=channel_colors.get(ch_idx))
+                fig = _psd_figure(series, figsize=(4, 3), title=f"Power — {index_to_label[ch_idx]}")
+                panes.append(pn.pane.Matplotlib(fig, tight=True, width=440, height=340))
+            return panes
 
         def _update_gc_pane(ch1_idx, ch2_idx, label1, label2) -> bool:
             if not (show_gc.value and _PYGC_AVAILABLE):
@@ -1663,14 +1710,14 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
 
             def _linestyle(lfp_ch, spike_ch):
                 if lfp_ch == spike_ch:
-                    return "-" if (not split_by_stimulus or lfp_ch == selected[0]) else "--"
+                    return "-" if (not split_by_condition or lfp_ch == selected[0]) else "--"
                 return ":" if lfp_ch == selected[0] else "-."
 
             self_series, cross_series = [], []
             for lfp_ch, spike_ch in pairs:
                 is_cross = lfp_ch != spike_ch
                 linestyle = _linestyle(lfp_ch, spike_ch)
-                for i, (glabel, gmask) in enumerate(stim_groups):
+                for i, (glabel, gmask) in enumerate(cond_groups):
                     spikes_all = _pooled_trials_spikes_for(spike_ch, gmask)
                     if spikes_all is None or spikes_all.size == 0:
                         continue
@@ -1684,12 +1731,12 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
                             info_pane.object = f"**STA error:** {exc}"
                             continue
                         cache_key = (
-                            "sta", lfp_ch, spike_ch, "filt", sta_low, sta_high, glabel, subset_signature
+                            "sta", lfp_ch, spike_ch, "filt", sta_low, sta_high, glabel
                         )
                         suffix = f" filtered {sta_band_label}"
                     else:
                         lfp_all = _pooled_trials_raw_for(lfp_ch, gmask)
-                        cache_key = ("sta", lfp_ch, spike_ch, "raw", glabel, subset_signature)
+                        cache_key = ("sta", lfp_ch, spike_ch, "raw", glabel)
                         suffix = ""
                     t_rel, sta = _cached_spectral(
                         cache_key,
@@ -1702,7 +1749,7 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
                         if is_cross
                         else index_to_label[lfp_ch]
                     )
-                    if split_by_stimulus:
+                    if split_by_condition:
                         color = _STIMULUS_COLORS[i % len(_STIMULUS_COLORS)]
                         label = f"{label_core} — {glabel}{suffix}"
                     else:
@@ -1731,7 +1778,7 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
             for ch_idx in selected:
                 try:
                     bin_centers, mean_amp, mi = _cached_spectral(
-                        ("pac", ch_idx, phase_band, amp_band, subset_signature),
+                        ("pac", ch_idx, phase_band, amp_band),
                         lambda ch=ch_idx: _pac_modulation_index(
                             _pooled_trials_raw(ch), fsample, phase_band, amp_band
                         ),
@@ -1761,7 +1808,7 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
                     continue
                 try:
                     bin_centers, density, r = _cached_spectral(
-                        ("spike_phase", ch_idx, phase_low, phase_high, subset_signature),
+                        ("spike_phase", ch_idx, phase_low, phase_high),
                         lambda ch=ch_idx, s=spikes_all: _spike_phase_locking(
                             _pooled_trials_raw(ch), s, fsample, (phase_low, phase_high)
                         ),
@@ -1808,7 +1855,7 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
                 ).reshape(product.shape)
                 return product, percentile, thrs
             return _cached_spectral(
-                ("quantile", ch1_idx, ch2_idx, phase_low, phase_high, subset_signature), _compute
+                ("quantile", ch1_idx, ch2_idx, phase_low, phase_high), _compute
             )
 
         def _phase_diff_all(ch1_idx, ch2_idx):
@@ -1865,14 +1912,15 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
                 info_pane.object = f"**Phase-difference error:** {exc}"
                 return False
             # Quartile thresholds are always computed from the full (possibly
-            # stimulus-combined) trial subset -- see _quantile_data -- so Q1-Q4
-            # mean the same power-product regime across stimulus groups. When
-            # split_by_stimulus, one polar subplot per (stimulus, quantile
-            # bin) combination is added, all side by side in the same row
-            # (_phase_diff_circular_figure lays out a flat list that way).
+            # condition-combined) trial subset -- see _quantile_data -- so
+            # Q1-Q4 mean the same power-product regime across condition
+            # groups. When split_by_condition, one polar subplot per
+            # (condition group, quantile bin) combination is added, all side
+            # by side in the same row (_phase_diff_circular_figure lays out a
+            # flat list that way).
             window_mask = _burst_window_mask()
             results = []
-            for glabel, gmask in stim_groups:
+            for glabel, gmask in cond_groups:
                 product_g = product[gmask]
                 phase_diff_g = phase_diff_all[gmask]
                 window_g = window_mask[gmask]
@@ -1949,7 +1997,7 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
                 _event_times_for_trial(ds, trial_index, fsample),
             )
 
-            psd_pane.object = _psd_figure(_channel_psd_series(ch_idx), figsize=(4, 3))
+            power_panes = _update_power_panes()  # one pane for the single selected channel
 
             hilbert_panes = _update_hilbert_panes([lfp])
             extras = []
@@ -1963,7 +2011,7 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
                 [info_pane, lfp_pane]
                 + hilbert_panes
                 + ([pn.Row(*extras, sizing_mode="stretch_width")] if extras else [])
-                + [psd_pane]
+                + [pn.Row(*power_panes, sizing_mode="fixed")]
             )
         else:
             ch1_idx, ch2_idx = selected
@@ -1980,20 +2028,21 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
                 _event_times_for_trial(ds, trial_index, fsample),
             )
 
-            psd_pane.object = _dual_psd_figure(
-                _channel_psd_series(ch1_idx, color_override=_COLOR_RAW),
-                _channel_psd_series(ch2_idx, color_override=_COLOR_FILTERED),
-                label1, label2, figsize=(4, 3),
-            )
+            # Row 1: one dedicated, fixed-size power panel per channel
+            # (replaces the old combined twin-axes PSD panel).
+            power_panes = _update_power_panes()
+
+            # Row 2: coherence + GC, same fixed size as the power panels so
+            # all panes in the two rows line up.
             coherence_pane.object = _coherence_figure(
                 _channel_coherence_series(ch1_idx, ch2_idx), label1, label2, figsize=(4, 3)
             )
-            spectral_panes = [psd_pane, coherence_pane]
+            row2_panes = [coherence_pane]
             if _update_gc_pane(ch1_idx, ch2_idx, label1, label2):
-                spectral_panes.append(gc_pane)
+                row2_panes.append(gc_pane)
             elif show_gc.value and not _PYGC_AVAILABLE:
                 gc_pane.object = _gc_unavailable_figure(figsize=(4, 3))
-                spectral_panes.append(gc_pane)
+                row2_panes.append(gc_pane)
 
             hilbert_panes = _update_hilbert_panes([lfp1, lfp2])
             if _update_quantile_pane(ch1_idx, ch2_idx):
@@ -2012,7 +2061,8 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
                 [info_pane, lfp_pane]
                 + hilbert_panes
                 + ([pn.Row(*extras, sizing_mode="stretch_width")] if extras else [])
-                + [pn.Row(*spectral_panes, sizing_mode="stretch_width")]
+                + [pn.Row(*power_panes, sizing_mode="fixed")]
+                + [pn.Row(*row2_panes, sizing_mode="fixed")]
             )
 
         row = metadata.trial_info.iloc[trial_index]
@@ -2046,7 +2096,7 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
         #show_spikes,
         #show_events,
         #pn.layout.Divider(),
-        "### Trial subset (pooled analyses)",
+        "### Trial subset (pooled analyses; select 2+ in exactly one filter below to split power/coherence/GC into one line per value)",
         trial_type_filter,
         behavioral_response_filter,
         stimulus_filter,
