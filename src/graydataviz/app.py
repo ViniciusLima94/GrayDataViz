@@ -2096,7 +2096,7 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
         #show_spikes,
         #show_events,
         #pn.layout.Divider(),
-        "### Trial subset (pooled analyses; select 2+ in exactly one filter below to split power/coherence/GC into one line per value)",
+        #"### Trial subset (pooled analyses; select 2+ in exactly one filter below to split power/coherence/GC into one line per value)",
         trial_type_filter,
         behavioral_response_filter,
         stimulus_filter,
