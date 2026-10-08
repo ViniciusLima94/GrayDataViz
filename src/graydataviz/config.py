@@ -17,10 +17,10 @@ from pathlib import Path
 KNOWN_MONKEYS = ("lucy", "ethyl")
 
 _DEFAULT_RAW_ROOT = os.environ.get("GRAYDATAVIZ_RAW_ROOT",
-                                   os.path.expanduser("~/nas_data/GrayLab"))
+                                   os.path.expanduser("~/nas_data/GrayLab/"))
 
 _DEFAULT_RESULTS_ROOT = os.environ.get("GRAYDATAVIZ_RESULTS_ROOT",
-                                       os.path.expanduser("~/nas_data/phase_analysis/Results"))
+                                       os.path.expanduser("~/nas_data/phase_analysis/"))
 
 
 @dataclass(frozen=True)

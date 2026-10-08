@@ -51,7 +51,7 @@ try:
 
     _PYGC_AVAILABLE = True
 except ImportError:
-    granger_causality = None
+    spectral_granger_causality = None
     _PYGC_AVAILABLE = False
 
 from .config import DataConfig, default_config
@@ -231,6 +231,105 @@ def _gc_all_trials(
     freqs = np.asarray(freqs)
     fmask = (freqs >= _COH_FMIN) & (freqs <= min(_COH_FMAX, fsample / 2))
     return freqs[fmask], np.asarray(ix2y)[fmask], np.asarray(iy2x)[fmask]
+
+
+# Epoch windows, matching phase_coupling_analysis/util.py's
+# `create_epoched_data` as used by savecoherence.py. Times are seconds
+# relative to *cue* onset: epochs 1-4 are fixed, epoch 5 is the 0.4 s ending
+# at each trial's own match onset (rounded to 0.1 s first, exactly as
+# savecoherence.py does before epoching). Each window is half-open,
+# [t_i, t_i + 0.4): exactly round(0.4 * fsample) samples starting at t_i.
+# (Verified: on the loaded time axis, the pipeline's
+# `.sel(time=slice(t_i, t_f))` returns exactly these 400 samples, so a trial
+# with match onset 2.0 s fits a window that ends at the last loaded sample.)
+_EPOCH_FIXED_STARTS = [-0.4, 0.0, 0.5, 0.9]
+_EPOCH_LENGTH = 0.4
+_EPOCH_LABELS = [
+    "Epoch 1: -0.4-0 s",
+    "Epoch 2: 0-0.4 s",
+    "Epoch 3: 0.5-0.9 s",
+    "Epoch 4: 0.9-1.3 s",
+    "Epoch 5: match-0.4 to match",
+]
+
+
+def _epoch_windows_all_trials(
+    x: np.ndarray,
+    time: np.ndarray,
+    fsample: float,
+    cue_shift: np.ndarray,
+    match_on_rel: np.ndarray,
+) -> np.ndarray:
+    """Cut `x` (`(n_trials, n_times)`) into the 5 epochs above:
+    returns `(n_trials, 5, n_win)`, NaN-filled for any trial/epoch whose
+    window doesn't fit inside the loaded data (e.g. a missing match onset).
+
+    `cue_shift` (`(n_trials,)`, seconds) converts `time` (relative to the
+    chosen alignment) to cue-relative time: 0 for cue alignment,
+    `(t_match_on - t_cue_on) / fsample` for match alignment.
+    `match_on_rel` (`(n_trials,)`) is match onset in cue-relative seconds.
+    """
+    n_trials, n_times = x.shape
+    n_win = int(round(_EPOCH_LENGTH * fsample))
+    out = np.full((n_trials, len(_EPOCH_LABELS), n_win), np.nan)
+    for tr in range(n_trials):
+        t_first = time[0] + cue_shift[tr]  # cue-relative time of sample 0
+        starts = _EPOCH_FIXED_STARTS + [np.round(match_on_rel[tr], 1) - _EPOCH_LENGTH]
+        for e, t_i in enumerate(starts):
+            if not np.isfinite(t_i) or not np.isfinite(t_first):
+                continue
+            s0 = int(round((t_i - t_first) * fsample))
+            if s0 < 0 or s0 + n_win > n_times:
+                continue
+            out[tr, e] = x[tr, s0 : s0 + n_win]
+    return out
+
+
+def _epoch_exclusion_report(
+    x1: np.ndarray,
+    x2: np.ndarray,
+    time: np.ndarray,
+    fsample: float,
+    cue_shift: np.ndarray,
+    match_on_rel: np.ndarray,
+    excluded: np.ndarray,
+) -> list[str]:
+    """Explain, per epoch, why the `excluded` trials (bool mask) have an
+    incomplete window: no match onset, window outside the loaded data, or
+    NaN samples. Times in the text are cue-relative seconds."""
+    n_win = int(round(_EPOCH_LENGTH * fsample))
+    n_times = x1.shape[1]
+    lines = []
+    for e, label in enumerate(_EPOCH_LABELS):
+        no_match = outside = has_nan = 0
+        need_lo, need_hi, have_lo, have_hi = [], [], [], []
+        for tr in np.flatnonzero(excluded):
+            t_i = (_EPOCH_FIXED_STARTS + [np.round(match_on_rel[tr], 1) - _EPOCH_LENGTH])[e]
+            if not np.isfinite(t_i):
+                no_match += 1
+                continue
+            s0 = int(round((t_i - (time[0] + cue_shift[tr])) * fsample))
+            if s0 < 0 or s0 + n_win > n_times:
+                outside += 1
+                need_lo.append(t_i)
+                need_hi.append(t_i + _EPOCH_LENGTH)
+                have_lo.append(time[0] + cue_shift[tr])
+                have_hi.append(time[-1] + cue_shift[tr])
+            elif not (np.isfinite(x1[tr, s0 : s0 + n_win]).all() and np.isfinite(x2[tr, s0 : s0 + n_win]).all()):
+                has_nan += 1
+        parts = []
+        if outside:
+            parts.append(
+                f"{outside} outside loaded data (need {min(need_lo):.2f} to {max(need_hi):.2f} s, "
+                f"loaded {max(have_lo):.2f} to {min(have_hi):.2f} s)"
+            )
+        if no_match:
+            parts.append(f"{no_match} with no match onset")
+        if has_nan:
+            parts.append(f"{has_nan} with NaN samples")
+        if parts:
+            lines.append(f"{label}: " + "; ".join(parts))
+    return lines
 
 
 def _hilbert_analytic(x: np.ndarray, fsample: float, low: float, high: float) -> np.ndarray:
@@ -470,7 +569,7 @@ def _detect_microsaccades(
             valid = np.isfinite(x)
 
             # Avoid filtering NaNs.
-            if valid.sum() >= 10:
+            if valid.sum() > 3 * (2 * sos.shape[0] + 1):  # sosfiltfilt padlen
                 filtered_eye[trial, axis, valid] = sosfiltfilt(
                     sos,
                     x[valid],
@@ -600,7 +699,7 @@ def _detect_microsaccades(
         "events": events,
     }
 
-@pn.cache
+@pn.cache(max_items=3, policy="LRU")
 def _cached_session(
     config: DataConfig,
     monkey: str,
@@ -615,8 +714,8 @@ def _cached_session(
         date,
         session,
         align_to=align_to,
-        exclude_slvr_msmod=False,
-        only_unique_recordings=False,
+        exclude_slvr_msmod=exclude_slvr_msmod,
+        only_unique_recordings=only_unique_recordings,
         load_spike_times=True,
         load_eye=True,
         config=config,
@@ -745,6 +844,44 @@ def _coherence_figure(
     ax.set_ylabel("Coherence")
     ax.set_title(f"Coherence: {label1} vs {label2}", fontsize=9, pad=26)
     _legend_above(ax, len(series))
+    return fig
+
+
+def _epoch_coherence_figure(
+    panels: list[list[tuple]],
+    label1: str,
+    label2: str,
+    figsize: tuple[float, float],
+    note: str = "",
+    footnotes: list[str] | None = None,
+) -> Figure:
+    """`panels`: one list per epoch, each holding one
+    `(freqs_or_None, coh_or_None, color, group_name, n_trials)` tuple per
+    condition group. One axes per epoch, shared y-axis, one line per group."""
+    fig = Figure(figsize=figsize)
+    axes = fig.subplots(1, len(panels), sharey=True)
+    handles = {}
+    for ax, title, series in zip(np.atleast_1d(axes), _EPOCH_LABELS, panels):
+        counts = []
+        for freqs, coh, color, name, n in series:
+            counts.append(str(n))
+            if freqs is not None:
+                (line,) = ax.plot(freqs, coh, color=color, lw=1.4, label=name)
+                handles.setdefault(name, line)
+        ax.set_title(f"{title}\nn = {' / '.join(counts)}", fontsize=8)
+        ax.set_xlabel("Frequency (Hz)", fontsize=8)
+        ax.set_ylim(0, 1)
+        ax.tick_params(labelsize=7)
+    np.atleast_1d(axes)[0].set_ylabel("Coherence", fontsize=8)
+    fig.suptitle(f"Coherence by epoch: {label1} vs {label2}{note}", fontsize=9, y=0.995)
+    if handles:
+        fig.legend(
+            list(handles.values()), list(handles.keys()), loc="upper center",
+            bbox_to_anchor=(0.5, 0.925), ncol=min(len(handles), 8), fontsize=8, frameon=False,
+        )
+    fig.subplots_adjust(top=0.66, bottom=0.2, left=0.05, right=0.99, wspace=0.08)
+    if footnotes:
+        fig.text(0.01, 0.0, "\n".join(footnotes), fontsize=7, va="top", ha="left", color="#444444")
     return fig
 
 
@@ -889,7 +1026,7 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
         label="Include slvr/ms_mod-flagged channels", value=True
     )
     unique_recordings_only = pn.widgets.Checkbox(
-        label="Unique recordings only", value=True
+        label="Unique recordings only", value=False
     )
     
     # --- Raw data plot: everything that changes what the LFP trace (and its
@@ -909,6 +1046,14 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
         label="Granger causality spectrum (2 channels)",
         value=False,
         disabled=not _PYGC_AVAILABLE,
+    )
+    show_epoch_coherence = pn.widgets.Checkbox(
+        label="Coherence by epoch (2 channels; 5 epochs, one line per chosen stimulus)",
+        value=True,
+    )
+    epoch_pipeline_trials = pn.widgets.Checkbox(
+        label="  Epoch coherence: only TASK + CORRECT trials (as the pipeline)",
+        value=True,
     )
 
     # --- Spike-triggered average: its own filter/band, independent of the
@@ -1021,6 +1166,9 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
     )
     gc_pane = pn.pane.Matplotlib(
         Figure(figsize=(4, 3)), tight=True, sizing_mode="stretch_width"
+    )
+    epoch_coh_pane = pn.pane.Matplotlib(
+        Figure(figsize=(16, 3.6)), tight=True, sizing_mode="stretch_width"
     )
     envelope_bokeh, envelope_sources, envelope_lines = _make_linked_time_series_figure(
         lfp_bokeh.x_range, "Envelope (µV)"
@@ -1193,7 +1341,7 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
             _trial_label(metadata.trial_info, int(t)): int(t) for t in ds.trials.values
         }
         trial_select.options = trial_options
-        trial_select.value = next(iter(trial_options.values()))
+        trial_select.value = next(iter(trial_options.values()), None)
 
         channel_options = {
             _label(roi, ch, slvr, ms_mod): i
@@ -1203,7 +1351,7 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
         }
 
         channel_select.options = channel_options
-        channel_select.value = [next(iter(channel_options.values()))]
+        channel_select.value = list(channel_options.values())[:1]
         montage_channel_select.options = channel_options
         montage_channel_select.value = list(channel_options.values())
 
@@ -1284,7 +1432,7 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
                 pos -= 1
 
             # _detect_microsaccades expects (n_trials, 2, n_times); eye_trial is
-            # alre{ady sliced to this one trial (2, n_times), so add back a dummy
+            # already sliced to this one trial (2, n_times), so add back a dummy
             # trials axis and unwrap the (1, n_times) result with [0]. Use the
             # local `fsample` (ds.attrs["fsample"]) -- `ds.fsample` isn't a real
             # attribute and raises AttributeError.
@@ -1293,10 +1441,10 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
             )
             events = result["events"][0]
             xs.append(time)
-            ys.append(np.zeros(len(time), dtype=bool))
+            ms = np.full(len(time), np.nan)
             for event in events:
-                ti = np.argmin( np.abs( time -  event["peak_time"] - t_min) )  # Timing index
-                ys[-1][ti] = True
+                ms[event["peak_idx"]] = 1.0
+            ys.append(ms * amplitude_scale + pos * _MONTAGE_ROW_UNIT)
                 
             colors.append("#000000")
             ticks.append(pos * _MONTAGE_ROW_UNIT)
@@ -1310,7 +1458,10 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
         # Base the y-range on actual plotted values (not a fixed formula) so
         # high-amplitude_scale/high-z-score peaks on the top channel never get
         # clipped just because they exceed the nominal 1-row-unit spacing.
-        all_y_values = np.concatenate(ys) if ys[:-3] else np.array([0.0])
+        all_y_values = np.concatenate(ys) if ys else np.array([0.0])
+        all_y_values = all_y_values[np.isfinite(all_y_values)]
+        if all_y_values.size == 0:
+            all_y_values = np.array([0.0])
         y_data_min = np.nanmin(all_y_values)
         y_data_max = np.nanmax(all_y_values)
         y_padding = 0.5 * _MONTAGE_ROW_UNIT
@@ -1320,15 +1471,10 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
         montage_bokeh.height = montage_height_slider.value
 
         event_times = _event_times_for_trial(ds, trial_index, fsample)
-        match_on = event_times.get("match_on")
-        state["full_range"] = (
-            (t_min, t_max)#match_on + 0.5)
-            if match_on is not None and not np.isnan(match_on)
-            else (float(ds.time.values[0]), float(ds.time.values[-1]))
-        )  
+        state["full_range"] = (float(t_min), float(t_max))
         for key, sp in montage_event_spans.items():
             t = event_times.get(key)
-            if t is not None:
+            if t is not None and np.isfinite(t):
                 sp.location = t
                 sp.visible = True
             else:
@@ -1383,6 +1529,12 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
 
         def _cached_spectral(key, compute_fn):
             cache = state["spectral_cache"]
+            key = key + (
+                subset_mask.tobytes(),
+                tuple(trial_type_filter.value),
+                tuple(behavioral_response_filter.value),
+                tuple(stimulus_filter.value),
+            )
             if key not in cache:
                 cache[key] = compute_fn()
             return cache[key]
@@ -1657,6 +1809,93 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
                 return False
             gc_pane.object = _gc_figure(
                 _channel_gc_series(ch1_idx, ch2_idx), label1, label2, figsize=(4, 3)
+            )
+            return True
+
+        def _update_epoch_coherence_pane(ch1_idx, ch2_idx, label1, label2) -> bool:
+            # Coherence per epoch (see _EPOCH_LABELS) per condition group, the
+            # same per-epoch/per-stimulus loop savecoherence.py runs: raw
+            # (unfiltered) data, same multitaper params as every other
+            # coherence panel here. Groups follow the same trial-type /
+            # behavioral-response / stimulus split rule as the other panels
+            # (select 2+ stimuli to get one line per stimulus). To reproduce
+            # the saved pipeline output, restrict trials to TASK + CORRECT.
+            if not show_epoch_coherence.value:
+                return False
+            align_to = ds.attrs["align_to"]
+            t_cue = np.asarray(ds.attrs["t_cue_on"], dtype=float)
+            t_match = np.asarray(ds.attrs["t_match_on"], dtype=float)
+            t_align = t_cue if align_to == "cue" else t_match
+            cue_shift = (t_align - t_cue) / fsample
+            match_on_rel = (t_match - t_cue) / fsample
+
+            windows = {}
+            for ch in (ch1_idx, ch2_idx):
+                windows[ch] = _cached_spectral(
+                    ("epoch_windows", ch),
+                    lambda ch=ch: _epoch_windows_all_trials(
+                        _all_trials_raw(ch), time, fsample, cue_shift, match_on_rel
+                    ),
+                )
+            w1, w2 = windows[ch1_idx], windows[ch2_idx]
+
+            # Use one common trial set for all 5 epochs (as the pipeline does):
+            # only trials whose every epoch window is complete on both channels.
+            valid_all = np.ones(w1.shape[0], dtype=bool)
+            for e in range(len(_EPOCH_LABELS)):
+                valid_all &= np.isfinite(w1[:, e]).all(axis=1)
+                valid_all &= np.isfinite(w2[:, e]).all(axis=1)
+
+            # The pipeline only epochs trial_type == 1 (TASK) with
+            # behavioral_response == 1 (CORRECT) -- see util.load_session_data.
+            # Other trials (incorrect/aborted) often have no match onset.
+            if epoch_pipeline_trials.value:
+                rows = metadata.trial_info.iloc[ds.trials.values]
+                pipeline_mask = (
+                    (rows["trial_type"] == 1) & (rows["behavioral_response"] == 1)
+                ).to_numpy()
+            else:
+                pipeline_mask = np.ones(w1.shape[0], dtype=bool)
+
+            panels = [[] for _ in _EPOCH_LABELS]
+            excluded = 0
+            excl_mask = np.zeros(w1.shape[0], dtype=bool)
+            for gi, (glabel, gmask) in enumerate(cond_groups):
+                gmask = gmask & pipeline_mask
+                excl_mask |= gmask & ~valid_all
+                color = _STIMULUS_COLORS[gi % len(_STIMULUS_COLORS)] if glabel else _COLOR_RAW
+                name = glabel or "pooled"
+                ok = gmask & valid_all
+                n = int(ok.sum())
+                excluded += int((gmask & ~valid_all).sum())
+                for e in range(len(_EPOCH_LABELS)):
+                    if n < 2:
+                        panels[e].append((None, None, color, name, n))
+                        continue
+                    try:
+                        freqs, coh = _cached_spectral(
+                            ("epoch_coh", ch1_idx, ch2_idx, glabel, e, bool(epoch_pipeline_trials.value)),
+                            lambda e=e, ok=ok: _coherence_all_trials(
+                                w1[ok, e], w2[ok, e], fsample
+                            ),
+                        )
+                    except ValueError as exc:
+                        info_pane.object = f"**Epoch coherence error:** {exc}"
+                        return False
+                    panels[e].append((freqs, coh, color, name, n))
+            note = (
+                f" ({excluded} selected trials excluded: incomplete epoch window)"
+                if excluded
+                else ""
+            )
+            footnotes = []
+            if excluded:
+                footnotes = _epoch_exclusion_report(
+                    _all_trials_raw(ch1_idx), _all_trials_raw(ch2_idx),
+                    time, fsample, cue_shift, match_on_rel, excl_mask,
+                )
+            epoch_coh_pane.object = _epoch_coherence_figure(
+                panels, label1, label2, figsize=(16, 3.6), note=note, footnotes=footnotes
             )
             return True
 
@@ -1978,7 +2217,7 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
 
             for key, sp in event_spans.items():
                 t = event_times.get(key)
-                if t is not None:
+                if t is not None and np.isfinite(t):
                     sp.location = t
                     sp.visible = True
                 else:
@@ -2043,6 +2282,7 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
             elif show_gc.value and not _PYGC_AVAILABLE:
                 gc_pane.object = _gc_unavailable_figure(figsize=(4, 3))
                 row2_panes.append(gc_pane)
+            epoch_shown = _update_epoch_coherence_pane(ch1_idx, ch2_idx, label1, label2)
 
             hilbert_panes = _update_hilbert_panes([lfp1, lfp2])
             if _update_quantile_pane(ch1_idx, ch2_idx):
@@ -2063,6 +2303,7 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
                 + ([pn.Row(*extras, sizing_mode="stretch_width")] if extras else [])
                 + [pn.Row(*power_panes, sizing_mode="fixed")]
                 + [pn.Row(*row2_panes, sizing_mode="fixed")]
+                + ([pn.Row(epoch_coh_pane, sizing_mode="stretch_width")] if epoch_shown else [])
             )
 
         row = metadata.trial_info.iloc[trial_index]
@@ -2109,6 +2350,8 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
         raw_custom_low,
         raw_custom_high,
         show_gc,
+        show_epoch_coherence,
+        epoch_pipeline_trials,
         pn.layout.Divider(),
         "## Phase coupling",
         hilbert_mode,
@@ -2175,6 +2418,8 @@ def build_app(config: DataConfig | None = None) -> pn.viewable.Viewable:
         raw_custom_low,
         raw_custom_high,
         show_gc,
+        show_epoch_coherence,
+        epoch_pipeline_trials,
         hilbert_mode,
         phase_band_select,
         phase_custom_low,
